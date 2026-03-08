@@ -190,6 +190,8 @@ impl RocksDB {
         if let Some(cache) = &self.block_cache {
             let mut block_opts = rocksdb::BlockBasedOptions::default();
             block_opts.set_block_cache(cache);
+            block_opts.set_cache_index_and_filter_blocks(true);
+            block_opts.set_pin_l0_filter_and_index_blocks_in_cache(true);
             opts.set_block_based_table_factory(&block_opts);
         }
     }
@@ -216,6 +218,9 @@ impl RocksDB {
             // 4. Set the minimum number of write buffers to merge before flushing. 2
             // allows us to "double-buffer" writes, allowing for more efficient flush-to-disk.
             opts.set_min_write_buffer_number_to_merge(2);
+        } else {
+            // Default mode: bound memtable memory to 16MB × 2 = 32MB per DB instance
+            opts.set_write_buffer_size(16 * 1024 * 1024);
         }
 
         opts.create_if_missing(true); // Creates a database if it does not exist
