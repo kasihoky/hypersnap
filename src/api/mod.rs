@@ -24,6 +24,7 @@
 
 pub mod backfill;
 pub mod bridge;
+pub mod cast_hash_index;
 pub mod channels;
 pub mod config;
 pub mod conversations;
@@ -40,8 +41,10 @@ pub mod worker;
 
 pub use backfill::BackfillManager;
 pub use bridge::HubEventBridge;
+pub use cast_hash_index::CastHashIndexer;
 pub use channels::ChannelsIndexer;
 pub use config::ApiConfig;
+pub use config::FeatureConfig;
 pub use conversations::ConversationService;
 pub use events::{IndexEvent, IndexEventReceiver, IndexEventSender};
 pub use feeds::{FeedHandler, FeedService};
@@ -158,8 +161,18 @@ pub fn initialize(
         None
     };
 
+    // Cast hash index is always enabled when API is enabled — it's needed
+    // for O(1) cast-by-hash lookups across all endpoints.
+    let cast_hash_config = FeatureConfig {
+        enabled: true,
+        backfill_on_startup: true,
+        ..Default::default()
+    };
+    let cast_hash_indexer = Arc::new(CastHashIndexer::new(cast_hash_config, db.clone()));
+
     // Collect indexers that need backfill
     let mut backfill_indexers: Vec<Arc<dyn Indexer>> = Vec::new();
+    backfill_indexers.push(cast_hash_indexer.clone());
     if config.social_graph.backfill_on_startup {
         if let Some(ref idx) = social_graph_indexer {
             backfill_indexers.push(idx.clone());
@@ -180,6 +193,8 @@ pub fn initialize(
 
     // Create worker pool and register indexers
     let mut worker_pool = IndexWorkerPool::new(config.clone(), index_rx, db.clone());
+
+    worker_pool.register_arc(cast_hash_indexer.clone());
 
     if let Some(ref indexer) = social_graph_indexer {
         worker_pool.register_arc(indexer.clone());
@@ -241,7 +256,12 @@ pub fn initialize(
     }
 
     // Create HTTP handler
-    let http_handler = ApiHttpHandler::new(social_graph_indexer, channels_indexer, metrics_indexer);
+    let http_handler = ApiHttpHandler::new(
+        social_graph_indexer,
+        channels_indexer,
+        metrics_indexer,
+        Some(cast_hash_indexer),
+    );
 
     Some(ApiSystem {
         worker_handle,

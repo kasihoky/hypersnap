@@ -132,6 +132,7 @@ pub struct ApiHttpHandler {
     social_graph: Option<Arc<SocialGraphIndexer>>,
     channels: Option<Arc<ChannelsIndexer>>,
     metrics: Option<Arc<MetricsIndexer>>,
+    cast_hash_index: Option<Arc<crate::api::cast_hash_index::CastHashIndexer>>,
     conversations: Arc<std::sync::RwLock<Option<Arc<dyn ConversationHandler>>>>,
     feeds: Arc<std::sync::RwLock<Option<Arc<dyn FeedHandler>>>>,
     channel_feeds: Arc<std::sync::RwLock<Option<Arc<dyn ChannelFeedHandler>>>>,
@@ -146,11 +147,13 @@ impl ApiHttpHandler {
         social_graph: Option<Arc<SocialGraphIndexer>>,
         channels: Option<Arc<ChannelsIndexer>>,
         metrics: Option<Arc<MetricsIndexer>>,
+        cast_hash_index: Option<Arc<crate::api::cast_hash_index::CastHashIndexer>>,
     ) -> Self {
         Self {
             social_graph,
             channels,
             metrics,
+            cast_hash_index,
             conversations: Arc::new(std::sync::RwLock::new(None)),
             feeds: Arc::new(std::sync::RwLock::new(None)),
             channel_feeds: Arc::new(std::sync::RwLock::new(None)),
@@ -769,16 +772,12 @@ impl ApiHttpHandler {
                     ))
                 }
             };
-            // Resolve FID from hash via hub query
-            let hub = self.hub_query.read().unwrap().clone();
-            let resolved_fid = if let Some(ref hub) = hub {
-                hub.get_cast_by_hash(&hash)
-                    .await
-                    .and_then(|msg| msg.data.as_ref().map(|d| d.fid))
-                    .unwrap_or(0)
-            } else {
-                0
-            };
+            // Resolve FID from hash via cast hash index (O(1) lookup)
+            let resolved_fid = self
+                .cast_hash_index
+                .as_ref()
+                .and_then(|idx| idx.get_fid_by_hash(&hash))
+                .unwrap_or(0);
             if resolved_fid == 0 {
                 return Ok(Self::error_response(
                     StatusCode::NOT_FOUND,
@@ -1120,17 +1119,27 @@ impl ApiHttpHandler {
             }
         };
 
-        // If FID is provided, do a direct lookup; otherwise scan all shards
-        match hub.get_cast_by_hash(&hash).await {
-            Some(msg) => {
-                let cast = self.message_to_cast(&msg).await;
-                Ok(Self::json_response(StatusCode::OK, &CastResponse { cast }))
+        // Use cast hash index for O(1) FID resolution, then direct hub lookup
+        let resolved_fid = fid.or_else(|| {
+            self.cast_hash_index
+                .as_ref()
+                .and_then(|idx| idx.get_fid_by_hash(&hash))
+        });
+
+        if let Some(resolved_fid) = resolved_fid {
+            // Direct lookup by FID + hash (fast)
+            if let Ok((casts, _)) = hub.get_casts_by_fid(resolved_fid, 100, None, false).await {
+                if let Some(msg) = casts.into_iter().find(|c| c.hash == hash) {
+                    let cast = self.message_to_cast(&msg).await;
+                    return Ok(Self::json_response(StatusCode::OK, &CastResponse { cast }));
+                }
             }
-            None => Ok(Self::error_response(
-                StatusCode::NOT_FOUND,
-                "Cast not found",
-            )),
         }
+
+        Ok(Self::error_response(
+            StatusCode::NOT_FOUND,
+            "Cast not found",
+        ))
     }
 
     /// Handle GET /v2/farcaster/cast/bulk?hashes=0x...,0x...
@@ -1150,8 +1159,17 @@ impl ApiHttpHandler {
         for hash_str in hashes_str.split(',') {
             let hash_str = hash_str.trim().trim_start_matches("0x");
             if let Ok(hash) = hex::decode(hash_str) {
-                if let Some(msg) = hub.get_cast_by_hash(&hash).await {
-                    casts.push(self.message_to_cast(&msg).await);
+                // Use cast hash index for O(1) FID resolution
+                let fid = self
+                    .cast_hash_index
+                    .as_ref()
+                    .and_then(|idx| idx.get_fid_by_hash(&hash));
+                if let Some(fid) = fid {
+                    if let Ok((found, _)) = hub.get_casts_by_fid(fid, 100, None, false).await {
+                        if let Some(msg) = found.into_iter().find(|c| c.hash == hash) {
+                            casts.push(self.message_to_cast(&msg).await);
+                        }
+                    }
                 }
             }
         }
@@ -1645,8 +1663,14 @@ impl ApiHttpHandler {
             _ => 1, // default to likes
         };
 
-        // Use fid=0 to scan all shards
-        let target_fid = fid.unwrap_or(0);
+        // Resolve cast FID via hash index, fall back to provided fid
+        let target_fid = fid
+            .or_else(|| {
+                self.cast_hash_index
+                    .as_ref()
+                    .and_then(|idx| idx.get_fid_by_hash(&hash))
+            })
+            .unwrap_or(0);
         match hub
             .get_reactions_by_cast(target_fid, &hash, reaction_type, limit)
             .await
@@ -1926,7 +1950,7 @@ mod tests {
 
     #[test]
     fn test_can_handle() {
-        let handler = ApiHttpHandler::new(None, None, None);
+        let handler = ApiHttpHandler::new(None, None, None, None);
 
         // User endpoints
         assert!(handler.can_handle(&Method::GET, "/v2/farcaster/user"));
