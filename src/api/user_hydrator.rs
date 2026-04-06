@@ -55,6 +55,7 @@ where
             verified_accounts: Vec::new(),
             viewer_context: None,
             score: None,
+            followed_at: None,
         };
 
         // Fetch user data (username, display name, pfp, bio)

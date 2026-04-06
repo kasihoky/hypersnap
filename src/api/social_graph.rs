@@ -273,6 +273,114 @@ impl SocialGraphIndexer {
         Ok((results, next_cursor))
     }
 
+    /// Get paginated list of followers with follow timestamps.
+    pub fn get_followers_with_timestamps(
+        &self,
+        fid: u64,
+        cursor: Option<u64>,
+        limit: usize,
+    ) -> Result<(Vec<(u64, u32)>, Option<u64>), IndexerError> {
+        let prefix = Self::make_follower_prefix(fid);
+        let stop_prefix = Self::increment_prefix(&prefix);
+
+        let start_key = if let Some(cursor_fid) = cursor {
+            Self::make_follower_key(fid, cursor_fid + 1)
+        } else {
+            prefix.clone()
+        };
+
+        let mut results = Vec::with_capacity(limit + 1);
+
+        let page_options = crate::storage::db::PageOptions {
+            page_size: Some(limit + 1),
+            page_token: None,
+            reverse: false,
+        };
+
+        self.db
+            .for_each_iterator_by_prefix_paged(
+                Some(start_key),
+                Some(stop_prefix),
+                &page_options,
+                |key, value| {
+                    if key.len() == 18 {
+                        let follower_fid = u64::from_be_bytes(key[10..18].try_into().unwrap());
+                        let ts = if value.len() >= 4 {
+                            u32::from_be_bytes(value[..4].try_into().unwrap())
+                        } else {
+                            0
+                        };
+                        results.push((follower_fid, ts));
+                    }
+                    Ok(results.len() > limit)
+                },
+            )
+            .map_err(|e| IndexerError::Storage(e.to_string()))?;
+
+        let next_cursor = if results.len() > limit {
+            results.pop();
+            results.last().map(|(fid, _)| *fid)
+        } else {
+            None
+        };
+
+        Ok((results, next_cursor))
+    }
+
+    /// Get paginated list of following with follow timestamps.
+    pub fn get_following_with_timestamps(
+        &self,
+        fid: u64,
+        cursor: Option<u64>,
+        limit: usize,
+    ) -> Result<(Vec<(u64, u32)>, Option<u64>), IndexerError> {
+        let prefix = Self::make_following_prefix(fid);
+        let stop_prefix = Self::increment_prefix(&prefix);
+
+        let start_key = if let Some(cursor_fid) = cursor {
+            Self::make_following_key(fid, cursor_fid + 1)
+        } else {
+            prefix.clone()
+        };
+
+        let mut results = Vec::with_capacity(limit + 1);
+
+        let page_options = crate::storage::db::PageOptions {
+            page_size: Some(limit + 1),
+            page_token: None,
+            reverse: false,
+        };
+
+        self.db
+            .for_each_iterator_by_prefix_paged(
+                Some(start_key),
+                Some(stop_prefix),
+                &page_options,
+                |key, value| {
+                    if key.len() == 18 {
+                        let following_fid = u64::from_be_bytes(key[10..18].try_into().unwrap());
+                        let ts = if value.len() >= 4 {
+                            u32::from_be_bytes(value[..4].try_into().unwrap())
+                        } else {
+                            0
+                        };
+                        results.push((following_fid, ts));
+                    }
+                    Ok(results.len() > limit)
+                },
+            )
+            .map_err(|e| IndexerError::Storage(e.to_string()))?;
+
+        let next_cursor = if results.len() > limit {
+            results.pop();
+            results.last().map(|(fid, _)| *fid)
+        } else {
+            None
+        };
+
+        Ok((results, next_cursor))
+    }
+
     /// Increment a prefix to create an exclusive upper bound.
     fn increment_prefix(prefix: &[u8]) -> Vec<u8> {
         let mut result = prefix.to_vec();

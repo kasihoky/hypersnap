@@ -30,6 +30,9 @@ pub struct User {
     pub viewer_context: Option<ViewerContext>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub score: Option<f64>,
+    /// Timestamp when the follow was created (only in followers/following responses)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub followed_at: Option<String>,
 }
 
 impl Default for User {
@@ -51,6 +54,7 @@ impl Default for User {
             verified_accounts: Vec::new(),
             viewer_context: None,
             score: None,
+            followed_at: None,
         }
     }
 }

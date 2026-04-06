@@ -578,9 +578,15 @@ impl ApiHttpHandler {
 
         let cursor_u64: Option<u64> = cursor.and_then(|s| s.parse().ok());
 
-        match indexer.get_followers(fid, cursor_u64, limit) {
-            Ok((follower_fids, next_cursor)) => {
-                let users = self.get_users(&follower_fids).await;
+        match indexer.get_followers_with_timestamps(fid, cursor_u64, limit) {
+            Ok((follower_entries, next_cursor)) => {
+                let fids: Vec<u64> = follower_entries.iter().map(|(f, _)| *f).collect();
+                let mut users = self.get_users(&fids).await;
+                for (user, (_, ts)) in users.iter_mut().zip(follower_entries.iter()) {
+                    if *ts > 0 {
+                        user.followed_at = Some(format_timestamp(*ts));
+                    }
+                }
                 let response = FollowersResponse {
                     users,
                     next: NextCursor {
@@ -612,9 +618,15 @@ impl ApiHttpHandler {
 
         let cursor_u64: Option<u64> = cursor.and_then(|s| s.parse().ok());
 
-        match indexer.get_following(fid, cursor_u64, limit) {
-            Ok((following_fids, next_cursor)) => {
-                let users = self.get_users(&following_fids).await;
+        match indexer.get_following_with_timestamps(fid, cursor_u64, limit) {
+            Ok((following_entries, next_cursor)) => {
+                let fids: Vec<u64> = following_entries.iter().map(|(f, _)| *f).collect();
+                let mut users = self.get_users(&fids).await;
+                for (user, (_, ts)) in users.iter_mut().zip(following_entries.iter()) {
+                    if *ts > 0 {
+                        user.followed_at = Some(format_timestamp(*ts));
+                    }
+                }
                 let response = FollowersResponse {
                     users,
                     next: NextCursor {
