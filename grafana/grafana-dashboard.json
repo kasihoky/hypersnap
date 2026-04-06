@@ -765,10 +765,7 @@
       "type": "row"
     },
     {
-      "datasource": {
-        "type": "graphite",
-        "uid": "${DS_GRAPHITE}"
-      },
+      "datasource": "Graphite",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -810,10 +807,7 @@
       "type": "timeseries"
     },
     {
-      "datasource": {
-        "type": "graphite",
-        "uid": "${DS_GRAPHITE}"
-      },
+      "datasource": "Graphite",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -851,10 +845,7 @@
       "type": "timeseries"
     },
     {
-      "datasource": {
-        "type": "graphite",
-        "uid": "${DS_GRAPHITE}"
-      },
+      "datasource": "Graphite",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -907,10 +898,7 @@
       "type": "row"
     },
     {
-      "datasource": {
-        "type": "graphite",
-        "uid": "${DS_GRAPHITE}"
-      },
+      "datasource": "Graphite",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -948,10 +936,7 @@
       "type": "timeseries"
     },
     {
-      "datasource": {
-        "type": "graphite",
-        "uid": "${DS_GRAPHITE}"
-      },
+      "datasource": "Graphite",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -989,10 +974,7 @@
       "type": "timeseries"
     },
     {
-      "datasource": {
-        "type": "graphite",
-        "uid": "${DS_GRAPHITE}"
-      },
+      "datasource": "Graphite",
       "fieldConfig": {
         "defaults": {
           "color": {

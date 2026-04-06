@@ -9,7 +9,6 @@ CURRENT_VERSION="1"
 
 REPO="farcasterorg/hypersnap"
 RAWFILE_BASE="https://raw.githubusercontent.com/$REPO"
-LATEST_TAG="@latest"
 
 # Release channel: "stable" (default) or "nightly".
 # Set HYPERSNAP_CHANNEL=nightly in .env (or export it) to track the nightly builds.
@@ -20,8 +19,11 @@ HYPERSNAP_CHANNEL="${HYPERSNAP_CHANNEL:-stable}"
 
 if [ "$HYPERSNAP_CHANNEL" = "nightly" ]; then
     DOCKER_COMPOSE_FILE_PATH="docker-compose.nightly.yml"
+    # Nightly fetches scripts/configs from main branch, not @latest tag
+    LATEST_TAG="refs/heads/main"
 else
     DOCKER_COMPOSE_FILE_PATH="docker-compose.mainnet.yml"
+    LATEST_TAG="@latest"
 fi
 
 SCRIPT_FILE_PATH="scripts/hypersnap.sh"

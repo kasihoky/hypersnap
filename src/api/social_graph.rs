@@ -47,7 +47,8 @@ mod keys {
 /// v1: initial follower/following tracking
 /// v2: fix batch processing of LinkCompactState (flush txn before compact state)
 /// v3: fix incomplete data clearing (was limited to 100K entries, now loops to completion)
-const SOCIAL_GRAPH_SCHEMA_VERSION: u32 = 3;
+/// v4: switch to block-based backfill (reads shard chunks, not HubEvents)
+const SOCIAL_GRAPH_SCHEMA_VERSION: u32 = 4;
 
 /// Social graph indexer that tracks follow relationships.
 pub struct SocialGraphIndexer {
@@ -616,40 +617,43 @@ impl SocialGraphIndexer {
             tracing::info!("Cleared {} social graph index entries", total_deleted);
         }
 
-        // Clear per-shard backfill checkpoints (prefix 0xE3, name "social_graph")
-        let name = "social_graph";
-        let mut cp_prefix = Vec::with_capacity(2 + name.len());
-        cp_prefix.push(0xE3);
-        cp_prefix.push(name.len() as u8);
-        cp_prefix.extend_from_slice(name.as_bytes());
-        let cp_stop = {
-            let mut s = cp_prefix.clone();
-            if let Some(last) = s.last_mut() {
-                *last += 1;
+        // Clear per-shard backfill checkpoints for both the old event-based
+        // backfill ("social_graph") and the new block-based backfill
+        // ("api_block_backfill") which is shared across all indexers.
+        for name in ["social_graph", "api_block_backfill"] {
+            let mut cp_prefix = Vec::with_capacity(2 + name.len());
+            cp_prefix.push(0xE3);
+            cp_prefix.push(name.len() as u8);
+            cp_prefix.extend_from_slice(name.as_bytes());
+            let cp_stop = {
+                let mut s = cp_prefix.clone();
+                if let Some(last) = s.last_mut() {
+                    *last += 1;
+                }
+                s
+            };
+            let mut cp_keys = Vec::new();
+            let page_options = crate::storage::db::PageOptions {
+                page_size: Some(100),
+                page_token: None,
+                reverse: false,
+            };
+            let _ = db.for_each_iterator_by_prefix_paged(
+                Some(cp_prefix),
+                Some(cp_stop),
+                &page_options,
+                |key, _| {
+                    cp_keys.push(key.to_vec());
+                    Ok(false)
+                },
+            );
+            if !cp_keys.is_empty() {
+                let mut txn = RocksDbTransactionBatch::new();
+                for key in cp_keys {
+                    txn.delete(key);
+                }
+                let _ = db.commit(txn);
             }
-            s
-        };
-        let mut cp_keys = Vec::new();
-        let page_options = crate::storage::db::PageOptions {
-            page_size: Some(100),
-            page_token: None,
-            reverse: false,
-        };
-        let _ = db.for_each_iterator_by_prefix_paged(
-            Some(cp_prefix),
-            Some(cp_stop),
-            &page_options,
-            |key, _| {
-                cp_keys.push(key.to_vec());
-                Ok(false)
-            },
-        );
-        if !cp_keys.is_empty() {
-            let mut txn = RocksDbTransactionBatch::new();
-            for key in cp_keys {
-                txn.delete(key);
-            }
-            let _ = db.commit(txn);
         }
     }
 }
