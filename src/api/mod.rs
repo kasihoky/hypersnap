@@ -81,6 +81,8 @@ pub struct ApiSystem {
     pub shutdown_tx: broadcast::Sender<()>,
     /// HTTP handler for api endpoints.
     pub http_handler: ApiHttpHandler,
+    /// Search indexer (if enabled), for wiring into the HTTP handler.
+    pub search_indexer: Option<Arc<SearchIndexer>>,
 }
 
 impl ApiSystem {
@@ -161,6 +163,19 @@ pub fn initialize(
         None
     };
 
+    let search_indexer = if config.search.enabled {
+        tracing::info!("Search indexer enabled");
+        match SearchIndexer::new(config.search.clone(), &config.search.index_path) {
+            Ok(indexer) => Some(Arc::new(indexer)),
+            Err(e) => {
+                tracing::warn!("Failed to initialize search indexer: {:?}", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // Cast hash index is always enabled when API is enabled — it's needed
     // for O(1) cast-by-hash lookups across all endpoints.
     let cast_hash_config = FeatureConfig {
@@ -188,6 +203,11 @@ pub fn initialize(
             backfill_indexers.push(idx.clone());
         }
     }
+    if config.search.backfill_on_startup {
+        if let Some(ref idx) = search_indexer {
+            backfill_indexers.push(idx.clone());
+        }
+    }
 
     let needs_backfill = !backfill_indexers.is_empty();
 
@@ -205,6 +225,10 @@ pub fn initialize(
     }
 
     if let Some(ref indexer) = metrics_indexer {
+        worker_pool.register_arc(indexer.clone());
+    }
+
+    if let Some(ref indexer) = search_indexer {
         worker_pool.register_arc(indexer.clone());
     }
 
@@ -262,6 +286,7 @@ pub fn initialize(
         bridge_handles,
         shutdown_tx,
         http_handler,
+        search_indexer,
     })
 }
 

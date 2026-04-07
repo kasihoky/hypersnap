@@ -59,6 +59,7 @@ async fn start_servers(
     replicator: Option<Arc<replication::replicator::Replicator>>,
     local_state_store: LocalStateStore,
     api_handler: Option<snapchain::api::ApiHttpHandler>,
+    api_system_search_indexer: Option<Arc<snapchain::api::SearchIndexer>>,
 ) {
     let grpc_addr = app_config.rpc_address.clone();
     let grpc_socket_addr: SocketAddr = grpc_addr.parse().unwrap();
@@ -175,16 +176,8 @@ async fn start_servers(
             handler.set_feeds(feeds.clone());
             handler.set_channel_feeds(feeds);
         }
-        if app_config.api.search.enabled {
-            match snapchain::api::SearchIndexer::new(
-                app_config.api.search.clone(),
-                &app_config.api.search.index_path,
-            ) {
-                Ok(search) => handler.set_search(Arc::new(search)),
-                Err(e) => {
-                    warn!("Failed to initialize search indexer: {:?}", e);
-                }
-            }
+        if let Some(ref search) = api_system_search_indexer {
+            handler.set_search(search.clone());
         }
         // Wire user hydrator for populating User objects in API responses
         let social_graph_for_hydrator = if app_config.api.social_graph.enabled {
@@ -702,6 +695,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             h.set_statsd(statsd_client.clone());
             h
         });
+        let api_search_indexer = api_system.as_ref().and_then(|s| s.search_indexer.clone());
 
         start_servers(
             &app_config,
@@ -718,6 +712,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             replicator,
             local_state_store.clone(),
             api_handler,
+            api_search_indexer,
         )
         .await;
 
@@ -1003,6 +998,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             h.set_statsd(statsd_client.clone());
             h
         });
+        let api_search_indexer = api_system.as_ref().and_then(|s| s.search_indexer.clone());
 
         start_servers(
             &app_config,
@@ -1019,6 +1015,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             replicator,
             local_state_store.clone(),
             api_handler,
+            api_search_indexer,
         )
         .await;
 
