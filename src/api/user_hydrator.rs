@@ -41,16 +41,23 @@ where
             display_name: None,
             custody_address: String::new(),
             pfp_url: None,
+            registered_at: String::new(),
             profile: UserProfile {
                 bio: Bio {
                     text: String::new(),
                 },
+                location: None,
+                banner: None,
             },
             follower_count: 0,
             following_count: 0,
             verifications: Vec::new(),
+            auth_addresses: Vec::new(),
             verified_addresses: VerifiedAddresses::default(),
+            verified_accounts: Vec::new(),
             viewer_context: None,
+            score: None,
+            followed_at: None,
         };
 
         // Fetch user data (username, display name, pfp, bio)
@@ -81,10 +88,7 @@ where
             match self.hydrate_user(fid).await {
                 Some(user) => users.push(user),
                 None => {
-                    // Shouldn't happen since hydrate_user always returns Some,
-                    // but fall back to stub if it ever does
                     users.push(User {
-                        object: "user".to_string(),
                         fid,
                         username: format!("fid:{}", fid),
                         ..Default::default()
@@ -163,12 +167,18 @@ where
 
             match Protocol::try_from(body.protocol) {
                 Ok(Protocol::Ethereum) => {
-                    user.verified_addresses.eth_addresses.push(addr);
+                    user.verified_addresses.eth_addresses.push(addr.clone());
+                    if user.verified_addresses.primary.eth_address.is_none() {
+                        user.verified_addresses.primary.eth_address = Some(addr);
+                    }
                 }
                 Ok(Protocol::Solana) => {
                     // Solana addresses are base58, not hex
                     let sol_addr = bs58::encode(&body.address).into_string();
-                    user.verified_addresses.sol_addresses.push(sol_addr);
+                    user.verified_addresses.sol_addresses.push(sol_addr.clone());
+                    if user.verified_addresses.primary.sol_address.is_none() {
+                        user.verified_addresses.primary.sol_address = Some(sol_addr);
+                    }
                 }
                 _ => {}
             }
@@ -176,12 +186,23 @@ where
     }
 
     async fn populate_custody_address(&self, fid: u64, user: &mut User) {
-        if let Some(addr) = self.fetch_custody_address(fid).await {
-            user.custody_address = format!("0x{}", hex::encode(addr.as_slice()));
+        if let Some(info) = self.fetch_custody_info(fid).await {
+            user.custody_address = format!("0x{}", hex::encode(info.address.as_slice()));
+            // Populate registered_at from the on-chain event block timestamp.
+            if info.block_timestamp > 0 {
+                user.registered_at =
+                    chrono::DateTime::from_timestamp(info.block_timestamp as i64, 0)
+                        .map(|dt| dt.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string())
+                        .unwrap_or_default();
+            }
         }
     }
 
-    async fn fetch_custody_address(&self, fid: u64) -> Option<Address> {
+    /// Fetch the FID's current custody address along with the on-chain
+    /// block timestamp of the registration event. Returns `None` when
+    /// the FID has no `IdRegistry` event yet, or when the event body
+    /// is malformed.
+    async fn fetch_custody_info(&self, fid: u64) -> Option<CustodyInfo> {
         let request = Request::new(proto::FidRequest {
             fid,
             page_size: None,
@@ -195,6 +216,7 @@ where
             .await
             .ok()?;
         let event = response.get_ref();
+        let block_timestamp = event.block_timestamp;
         let proto::on_chain_event::Body::IdRegisterEventBody(body) = event.body.as_ref()? else {
             return None;
         };
@@ -203,8 +225,18 @@ where
         }
         let mut bytes = [0u8; 20];
         bytes.copy_from_slice(&body.to);
-        Some(Address::from(bytes))
+        Some(CustodyInfo {
+            address: Address::from(bytes),
+            block_timestamp,
+        })
     }
+}
+
+/// Snapshot of the data the hydrator extracts from a single
+/// `IdRegistry` on-chain event.
+struct CustodyInfo {
+    address: Address,
+    block_timestamp: u64,
 }
 
 #[async_trait]
@@ -213,6 +245,6 @@ where
     S: proto::hub_service_server::HubService + Send + Sync + 'static,
 {
     async fn get_custody_address(&self, fid: u64) -> Option<Address> {
-        self.fetch_custody_address(fid).await
+        self.fetch_custody_info(fid).await.map(|info| info.address)
     }
 }
