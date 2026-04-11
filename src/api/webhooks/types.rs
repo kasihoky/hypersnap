@@ -30,7 +30,7 @@ pub struct Webhook {
 }
 
 /// HMAC-SHA512 signing secret. Webhooks may carry multiple to support rotation.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WebhookSecret {
     pub uid: Uuid,
     pub value: String,
@@ -153,36 +153,61 @@ impl EventTypeByte {
     }
 }
 
-/// Operations the EIP-712 verifier will accept in the `X-Hypersnap-Op` header.
+/// Operations the EIP-712 verifier will accept in the `X-Hypersnap-Op`
+/// header. Shared across every management endpoint that uses custody
+/// auth — webhooks today, mini-app registration in the notifications
+/// module.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WebhookOp {
-    Create,
-    Update,
-    Delete,
-    Read,
-    /// Generate a fresh signing secret + grace-period-expire the
-    /// existing ones.
-    RotateSecret,
+pub enum SignedOp {
+    WebhookCreate,
+    WebhookUpdate,
+    WebhookDelete,
+    WebhookRead,
+    /// Generate a fresh webhook signing secret + grace-period-expire
+    /// the existing ones.
+    WebhookRotateSecret,
+
+    /// Register a new mini-app. Server assigns the `app_id`.
+    AppCreate,
+    /// Update mutable fields on a mini-app (name, app_url,
+    /// signer_fid_allowlist, description).
+    AppUpdate,
+    /// Delete a mini-app and all of its registered notification tokens.
+    AppDelete,
+    /// Look up one app or list the caller's apps.
+    AppRead,
+    /// Generate a fresh send secret for an app.
+    AppRotateSecret,
 }
 
-impl WebhookOp {
+impl SignedOp {
     pub fn as_str(self) -> &'static str {
         match self {
-            WebhookOp::Create => "webhook.create",
-            WebhookOp::Update => "webhook.update",
-            WebhookOp::Delete => "webhook.delete",
-            WebhookOp::Read => "webhook.read",
-            WebhookOp::RotateSecret => "webhook.rotate_secret",
+            SignedOp::WebhookCreate => "webhook.create",
+            SignedOp::WebhookUpdate => "webhook.update",
+            SignedOp::WebhookDelete => "webhook.delete",
+            SignedOp::WebhookRead => "webhook.read",
+            SignedOp::WebhookRotateSecret => "webhook.rotate_secret",
+            SignedOp::AppCreate => "app.create",
+            SignedOp::AppUpdate => "app.update",
+            SignedOp::AppDelete => "app.delete",
+            SignedOp::AppRead => "app.read",
+            SignedOp::AppRotateSecret => "app.rotate_secret",
         }
     }
 
     pub fn parse(s: &str) -> Option<Self> {
         match s {
-            "webhook.create" => Some(WebhookOp::Create),
-            "webhook.update" => Some(WebhookOp::Update),
-            "webhook.delete" => Some(WebhookOp::Delete),
-            "webhook.read" => Some(WebhookOp::Read),
-            "webhook.rotate_secret" => Some(WebhookOp::RotateSecret),
+            "webhook.create" => Some(SignedOp::WebhookCreate),
+            "webhook.update" => Some(SignedOp::WebhookUpdate),
+            "webhook.delete" => Some(SignedOp::WebhookDelete),
+            "webhook.read" => Some(SignedOp::WebhookRead),
+            "webhook.rotate_secret" => Some(SignedOp::WebhookRotateSecret),
+            "app.create" => Some(SignedOp::AppCreate),
+            "app.update" => Some(SignedOp::AppUpdate),
+            "app.delete" => Some(SignedOp::AppDelete),
+            "app.read" => Some(SignedOp::AppRead),
+            "app.rotate_secret" => Some(SignedOp::AppRotateSecret),
             _ => None,
         }
     }
@@ -233,15 +258,15 @@ mod tests {
     #[test]
     fn op_round_trip() {
         for op in [
-            WebhookOp::Create,
-            WebhookOp::Update,
-            WebhookOp::Delete,
-            WebhookOp::Read,
-            WebhookOp::RotateSecret,
+            SignedOp::WebhookCreate,
+            SignedOp::WebhookUpdate,
+            SignedOp::WebhookDelete,
+            SignedOp::WebhookRead,
+            SignedOp::WebhookRotateSecret,
         ] {
-            assert_eq!(WebhookOp::parse(op.as_str()), Some(op));
+            assert_eq!(SignedOp::parse(op.as_str()), Some(op));
         }
-        assert_eq!(WebhookOp::parse("webhook.bogus"), None);
+        assert_eq!(SignedOp::parse("webhook.bogus"), None);
     }
 
     #[test]

@@ -21,6 +21,20 @@
 //! - `DELETE /v2/farcaster/webhook/?webhook_id=…`          — delete
 //! - `POST   /v2/farcaster/webhook/secret/rotate?webhook_id=…` — rotate signing secret
 //!
+//! ## Admin override
+//!
+//! Any management request may instead authenticate with an
+//! `X-Admin-Api-Key: <key>` header whose value matches
+//! `webhooks.admin_api_key` in config. When present, the admin path
+//! bypasses EIP-712 verification and ownership checks — the admin
+//! can create, update, delete, rotate, or list webhooks owned by any
+//! FID. Admin create requires `?owner_fid=<fid>`; admin list without
+//! `?owner_fid=` returns every webhook across every owner. Leave
+//! `admin_api_key` unset by default and treat it as a root
+//! credential. The same header works against
+//! `/v2/farcaster/frame/app/*` when `notifications.admin_api_key` is
+//! set.
+//!
 //! ## EIP-712 ownership signature
 //!
 //! Auth lives entirely in HTTP headers so the request body is the literal
@@ -29,7 +43,12 @@
 //! Required headers:
 //!
 //! - `X-Hypersnap-Fid: <decimal>`
-//! - `X-Hypersnap-Op: webhook.create | .update | .delete | .read | .rotate_secret`
+//! - `X-Hypersnap-Op: <op>` where `<op>` is one of
+//!   `webhook.create` / `webhook.update` / `webhook.delete` / `webhook.read` /
+//!   `webhook.rotate_secret` / `app.create` / `app.update` / `app.delete` /
+//!   `app.read` / `app.rotate_secret`. The app operations cover the mini-app
+//!   registration management endpoints under `/v2/farcaster/frame/app/` and
+//!   share the same EIP-712 domain + verification path.
 //! - `X-Hypersnap-Signed-At: <unix seconds>`
 //! - `X-Hypersnap-Nonce: 0x<32 bytes hex>`
 //! - `X-Hypersnap-Signature: 0x<65 bytes hex>`
@@ -41,7 +60,7 @@
 //!   { name: "Hypersnap", version: "1", chainId: 10 }
 //!
 //! Type:
-//!   WebhookOperation(
+//!   HypersnapSignedOp(
 //!     string  op,           // mirrors X-Hypersnap-Op
 //!     uint64  fid,
 //!     uint256 signedAt,     // unix seconds

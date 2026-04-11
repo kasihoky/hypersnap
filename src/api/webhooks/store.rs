@@ -197,6 +197,32 @@ impl WebhookStore {
         Ok(ids)
     }
 
+    /// List every registered webhook across every owner, up to `max`.
+    /// Used by the admin override (`X-Admin-Api-Key`) for moderation
+    /// and bulk inspection. Iterates the primary prefix.
+    pub fn list_all(&self, max: usize) -> Result<Vec<Webhook>, WebhookStoreError> {
+        let prefix = vec![PREFIX, SUB_PRIMARY];
+        let stop = increment_prefix(&prefix);
+        let mut out = Vec::new();
+        self.db
+            .for_each_iterator_by_prefix(
+                Some(prefix),
+                Some(stop),
+                &crate::storage::db::PageOptions::default(),
+                |_key, value| {
+                    if out.len() >= max {
+                        return Ok(true);
+                    }
+                    if let Ok(webhook) = serde_json::from_slice::<Webhook>(value) {
+                        out.push(webhook);
+                    }
+                    Ok(false)
+                },
+            )
+            .map_err(|e| WebhookStoreError::Storage(e.to_string()))?;
+        Ok(out)
+    }
+
     fn write_record(
         &self,
         txn: &mut RocksDbTransactionBatch,

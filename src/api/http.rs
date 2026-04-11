@@ -8,7 +8,9 @@ use crate::api::conversations::{Conversation as ConversationData, ConversationEr
 use crate::api::feeds::{FeedError, FeedHandler};
 use crate::api::indexer::Indexer;
 use crate::api::metrics::MetricsIndexer;
-use crate::api::notifications::{NotificationSendHandler, NotificationWebhookHandler};
+use crate::api::notifications::{
+    NotificationAppHandler, NotificationSendHandler, NotificationWebhookHandler,
+};
 use crate::api::search::SearchIndexer;
 use crate::api::social_graph::SocialGraphIndexer;
 use crate::api::types::{
@@ -159,8 +161,18 @@ pub struct ApiHttpHandler {
     /// are enabled and the JFS lookup is wired up.
     notifications: Arc<std::sync::RwLock<Option<NotificationWebhookHandler>>>,
     /// Mini app notification send endpoint. Set when notifications are
-    /// enabled and a send_api_key is configured.
+    /// enabled — authenticates against the per-app send secret.
     notification_sender: Arc<std::sync::RwLock<Option<NotificationSendHandler>>>,
+    /// Mini app registration management endpoints. Late-bound because
+    /// they need the custody-address lookup (same reason as `webhooks`).
+    notification_apps: Arc<std::sync::RwLock<Option<NotificationAppHandler>>>,
+    /// Shared mini-app registry, stashed here so main.rs can build the
+    /// `NotificationAppHandler` once the custody lookup is ready.
+    notification_app_store:
+        Arc<std::sync::RwLock<Option<Arc<crate::api::notifications::NotificationAppStore>>>>,
+    /// Shared per-user token store, same pattern.
+    notification_token_store:
+        Arc<std::sync::RwLock<Option<Arc<crate::api::notifications::NotificationStore>>>>,
 }
 
 impl ApiHttpHandler {
@@ -186,6 +198,9 @@ impl ApiHttpHandler {
             webhooks: Arc::new(std::sync::RwLock::new(None)),
             notifications: Arc::new(std::sync::RwLock::new(None)),
             notification_sender: Arc::new(std::sync::RwLock::new(None)),
+            notification_apps: Arc::new(std::sync::RwLock::new(None)),
+            notification_app_store: Arc::new(std::sync::RwLock::new(None)),
+            notification_token_store: Arc::new(std::sync::RwLock::new(None)),
         }
     }
 
@@ -202,6 +217,43 @@ impl ApiHttpHandler {
     /// Install the mini app notification send handler.
     pub fn set_notification_sender(&self, handler: NotificationSendHandler) {
         *self.notification_sender.write().unwrap() = Some(handler);
+    }
+
+    /// Install the mini app registration management handler.
+    pub fn set_notification_apps(&self, handler: NotificationAppHandler) {
+        *self.notification_apps.write().unwrap() = Some(handler);
+    }
+
+    /// Stash the shared mini-app registry store so the management
+    /// handler can be built later from main.rs (which has access to
+    /// the late-wired custody lookup).
+    pub fn set_notification_stores(
+        &self,
+        app_store: Arc<crate::api::notifications::NotificationAppStore>,
+        token_store: Arc<crate::api::notifications::NotificationStore>,
+    ) {
+        *self.notification_app_store.write().unwrap() = Some(app_store);
+        *self.notification_token_store.write().unwrap() = Some(token_store);
+    }
+
+    /// Build the `NotificationAppHandler` from previously-stashed
+    /// stores + the supplied config and auth verifier, and install it.
+    /// Called from main.rs once the custody lookup is available.
+    /// No-op if the notification subsystem wasn't enabled when
+    /// `api::initialize` ran (the stores won't be present).
+    pub fn install_notification_apps(
+        &self,
+        config: crate::api::config::NotificationsConfig,
+        auth: crate::api::webhooks::WebhookAuthVerifier,
+    ) {
+        let Some(app_store) = self.notification_app_store.read().unwrap().clone() else {
+            return;
+        };
+        let Some(token_store) = self.notification_token_store.read().unwrap().clone() else {
+            return;
+        };
+        let handler = NotificationAppHandler::new(config, app_store, token_store, auth);
+        self.set_notification_apps(handler);
     }
 
     /// Set the conversation handler (callable after construction).
@@ -282,6 +334,13 @@ impl ApiHttpHandler {
         // Mini app notification send endpoint.
         if self.notification_sender.read().unwrap().is_some()
             && NotificationSendHandler::can_handle(method, path)
+        {
+            return true;
+        }
+
+        // Mini app registration management endpoints.
+        if self.notification_apps.read().unwrap().is_some()
+            && NotificationAppHandler::can_handle(method, path)
         {
             return true;
         }
@@ -419,6 +478,21 @@ impl ApiHttpHandler {
                 None => Self::error_response(
                     StatusCode::SERVICE_UNAVAILABLE,
                     "Mini app notification sending not enabled",
+                ),
+            };
+            self.record_request_metric(&metric_key, start, response.status().as_u16());
+            return Ok(response);
+        }
+
+        // Mini app registration management — developer creates / reads /
+        // updates / deletes / rotates secret on their apps.
+        if NotificationAppHandler::can_handle(&method, &path) {
+            let app_handler = self.notification_apps.read().unwrap().clone();
+            let response = match app_handler {
+                Some(handler) => handler.handle(req).await,
+                None => Self::error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Mini app registration not enabled",
                 ),
             };
             self.record_request_metric(&metric_key, start, response.status().as_u16());

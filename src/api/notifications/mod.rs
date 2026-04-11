@@ -3,23 +3,34 @@
 //! # Overview
 //!
 //! Hypersnap acts as a multi-tenant proxy for Farcaster Mini App
-//! notifications. The flow has two halves:
+//! notifications. There are three moving parts:
 //!
-//! 1. **Token registration.** Each registered mini app exposes a per-app
-//!    webhook URL. Farcaster clients (Warpcast, etc.) POST JFS-signed events
-//!    to that URL when users add the mini app or toggle its notifications.
-//!    Hypersnap verifies the JFS signature and stores `(fid, app_id) →
+//! 1. **App registration.** Developers register their mini app via the
+//!    signed management API (`/v2/farcaster/frame/app/*`). Hypersnap
+//!    assigns a random 16-character base58 `app_id` and a fresh send
+//!    secret. The auth uses the same EIP-712 custody-signature scheme
+//!    as webhook management — whoever holds the FID's custody key owns
+//!    the app.
+//!
+//! 2. **Token registration.** Farcaster clients (Warpcast, etc.) POST
+//!    JFS-signed events to `/v2/farcaster/frame/webhook/<app_id>` when
+//!    users add the mini app or toggle its notifications. Hypersnap
+//!    verifies the JFS signature and stores `(fid, app_id) →
 //!    (notification_url, token, enabled)`.
 //!
-//! 2. **Send.** Mini app developers POST a notification payload to
-//!    Hypersnap's send endpoint. Hypersnap looks up enabled tokens, groups
-//!    them by `notification_url`, and POSTs in batches of ≤100 tokens to
-//!    each client. Responses are processed: successes counted, invalid
-//!    tokens deleted, rate-limited fids returned for retry.
+//! 3. **Send.** Mini app developers POST a notification payload to
+//!    `/v2/farcaster/frame/notifications/<app_id>` with the per-app
+//!    send secret in the `x-api-key` header. Hypersnap looks up
+//!    enabled tokens, groups them by `notification_url`, and POSTs in
+//!    batches of ≤100 tokens to each client. Responses are processed:
+//!    successes counted, invalid tokens deleted, rate-limited fids
+//!    returned for retry.
 //!
-//! Both halves match the upstream Farcaster Mini App spec
-//! (<https://miniapps.farcaster.xyz/docs/specification>) so any mini app
-//! that already supports the protocol works against Hypersnap unchanged.
+//! Token registration and send match the upstream Farcaster Mini App
+//! spec (<https://miniapps.farcaster.xyz/docs/specification>) so any
+//! mini app that already supports the protocol works against Hypersnap
+//! unchanged. App registration is specific to hypersnap and replaces
+//! the equivalent operator-console step other proxies expose.
 //!
 //! # Wire format
 //!
@@ -52,7 +63,11 @@
 //!
 //! `POST /v2/farcaster/frame/notifications/<app_id>`
 //!
-//! Auth: `x-api-key: <notifications.send_api_key>`.
+//! Auth: `x-api-key: <send_secret>`, where `<send_secret>` is the
+//! `value` of the most recently created unexpired entry in the
+//! app's `send_secrets` array. Developers get a fresh secret when
+//! they call `POST /v2/farcaster/frame/app/` and can rotate it via
+//! `POST /v2/farcaster/frame/app/secret/rotate`.
 //!
 //! Request body (mirrors upstream contract for drop-in client compatibility):
 //!
@@ -117,7 +132,22 @@
 //!
 //! `(fid, notificationId)` is deduped for `notifications.dedupe_ttl_secs`
 //! (default 24 h, matching the spec).
+//!
+//! # Admin override
+//!
+//! Any `/v2/farcaster/frame/app/*` management request may instead
+//! authenticate with an `X-Admin-Api-Key: <key>` header whose value
+//! matches `notifications.admin_api_key` in config. When present, the
+//! admin path bypasses EIP-712 verification and ownership checks —
+//! the admin can create, update, delete, rotate, or list any app on
+//! any FID. Admin create needs a `?owner_fid=<fid>` query parameter;
+//! admin list without `?owner_fid=` returns every app across every
+//! owner. See `webhooks::admin_api_key` for the matching knob on the
+//! webhook management surface. Treat as a root credential: leave
+//! unset by default and rotate out of band.
 
+pub mod app_handler;
+pub mod app_store;
 pub mod dedupe;
 pub mod jfs;
 pub mod send_handler;
@@ -126,6 +156,11 @@ pub mod store;
 pub mod types;
 pub mod webhook_handler;
 
+pub use app_handler::{apply_send_secret_rotation, NotificationAppHandler};
+pub use app_store::{
+    generate_app_id, generate_send_secret, AppListResponse, AppResponse, AppStoreError,
+    CreateAppRequest, NotificationAppStore, RegisteredApp, UpdateAppRequest, APP_ID_LEN,
+};
 pub use dedupe::Deduper;
 pub use jfs::{
     verify as verify_jfs, ActiveSignerLookup, JfsError, OnchainSignerLookup, VerifiedJfs,

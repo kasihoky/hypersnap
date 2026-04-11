@@ -2,26 +2,31 @@
 //!
 //! `POST /v2/farcaster/frame/notifications/<app_id>`
 //!
-//! Auth: `x-api-key: <notifications.send_api_key>`. Without a configured
-//! `send_api_key` the endpoint is permanently 503.
+//! Auth: `x-api-key: <per-app send secret>`. The secret is the `value`
+//! of the most recently created unexpired entry in the
+//! `RegisteredApp.send_secrets` array. Developers get a fresh secret
+//! when they call `POST /v2/farcaster/frame/app/` and can rotate it via
+//! `POST /v2/farcaster/frame/app/secret/rotate`.
 //!
 //! See `src/api/notifications/mod.rs` for the request/response shapes.
 //! All field naming and validation matches the upstream contract so
 //! existing developer SDKs work unchanged.
 
 use crate::api::config::NotificationsConfig;
+use crate::api::notifications::app_store::NotificationAppStore;
 use crate::api::notifications::dedupe::Deduper;
 use crate::api::notifications::sender::{
     fan_out, validate_request, SendError, SendNotificationResult,
 };
 use crate::api::notifications::store::NotificationStore;
 use crate::api::social_graph::SocialGraphIndexer;
+use crate::api::webhooks::pick_active_secret;
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Bytes;
 use hyper::{HeaderMap, Method, Request, Response, StatusCode};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::convert::Infallible;
 use std::sync::Arc;
 use tracing::warn;
@@ -34,7 +39,7 @@ const MAX_BODY_BYTES: usize = 32 * 1024;
 #[derive(Clone)]
 pub struct NotificationSendHandler {
     config: Arc<NotificationsConfig>,
-    apps: Arc<HashSet<String>>,
+    apps: Arc<NotificationAppStore>,
     store: Arc<NotificationStore>,
     social_graph: Option<Arc<SocialGraphIndexer>>,
     dedupe: Arc<Deduper>,
@@ -44,18 +49,14 @@ pub struct NotificationSendHandler {
 impl NotificationSendHandler {
     pub fn new(
         config: NotificationsConfig,
+        apps: Arc<NotificationAppStore>,
         store: Arc<NotificationStore>,
         social_graph: Option<Arc<SocialGraphIndexer>>,
     ) -> Self {
-        let apps = config
-            .apps
-            .iter()
-            .map(|a| a.app_id.clone())
-            .collect::<HashSet<_>>();
         let dedupe = Arc::new(Deduper::new(config.dedupe_ttl_secs));
         Self {
             config: Arc::new(config),
-            apps: Arc::new(apps),
+            apps,
             store,
             social_graph,
             dedupe,
@@ -80,18 +81,7 @@ impl NotificationSendHandler {
         let (parts, body) = req.into_parts();
         let path = parts.uri.path().to_string();
 
-        // 1. Auth.
-        let Some(expected_key) = self.config.send_api_key.as_deref() else {
-            return error_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "send_api_key not configured",
-            );
-        };
-        if !verify_api_key(&parts.headers, expected_key) {
-            return error_response(StatusCode::UNAUTHORIZED, "invalid x-api-key");
-        }
-
-        // 2. App ID from path.
+        // 1. App ID from path.
         let app_id = match path.strip_prefix(ROUTE_PREFIX) {
             Some(rest) => rest.trim_end_matches('/').to_string(),
             None => return error_response(StatusCode::NOT_FOUND, "unknown route"),
@@ -99,8 +89,27 @@ impl NotificationSendHandler {
         if app_id.is_empty() {
             return error_response(StatusCode::BAD_REQUEST, "missing app_id");
         }
-        if !self.apps.contains(&app_id) {
-            return error_response(StatusCode::NOT_FOUND, "unknown app_id");
+
+        // 2. Load the app record. 404 on unknown app_id — but be
+        // careful not to leak timing information: the 401 check below
+        // only runs when the record exists.
+        let app = match self.apps.get(&app_id) {
+            Ok(Some(a)) => a,
+            Ok(None) => return error_response(StatusCode::NOT_FOUND, "unknown app_id"),
+            Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        };
+
+        // 3. Auth — check the provided x-api-key against the app's
+        // most recent unexpired send secret.
+        let now = current_unix_secs();
+        let Some(active_secret) = pick_active_secret(&app.send_secrets, now) else {
+            return error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "app has no active send secret",
+            );
+        };
+        if !verify_api_key(&parts.headers, &active_secret.value) {
+            return error_response(StatusCode::UNAUTHORIZED, "invalid x-api-key");
         }
 
         // 3. Body.
@@ -255,6 +264,13 @@ fn verify_api_key(headers: &HeaderMap, expected: &str) -> bool {
         .and_then(|v| v.to_str().ok())
         .map(|got| constant_time_eq(got.as_bytes(), expected.as_bytes()))
         .unwrap_or(false)
+}
+
+fn current_unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {

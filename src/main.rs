@@ -202,21 +202,41 @@ async fn start_servers(
         // Wire hub query handler for direct hub data access (cast lookup, reactions, etc.)
         handler.set_hub_query(api_service.clone());
 
+        // Build one shared auth verifier for every custody-signed
+        // management endpoint (webhooks + mini app registration).
+        // Clones share the same nonce LRU, so a nonce used for
+        // webhook.create can't be replayed as app.create.
+        let shared_auth = if app_config.api.webhooks.enabled || app_config.api.notifications.enabled
+        {
+            Some(snapchain::api::webhooks::WebhookAuthVerifier::new(
+                custody_lookup.clone(),
+                app_config.api.webhooks.signed_at_window_secs,
+            ))
+        } else {
+            None
+        };
+
         // Optional: webhook management API.
         if app_config.api.webhooks.enabled {
             let store = Arc::new(snapchain::api::webhooks::WebhookStore::new(
                 block_stores.db.clone(),
             ));
-            let auth = snapchain::api::webhooks::WebhookAuthVerifier::new(
-                custody_lookup,
-                app_config.api.webhooks.signed_at_window_secs,
-            );
             let webhook_handler = snapchain::api::webhooks::WebhookManagementHandler::new(
                 app_config.api.webhooks.clone(),
                 store,
-                auth,
+                shared_auth.clone().expect("shared_auth built above"),
             );
             handler.set_webhooks(webhook_handler);
+        }
+
+        // Optional: mini app registration management API. The stores
+        // were stashed on the handler by `api::initialize`; the helper
+        // reads them and installs the management handler.
+        if app_config.api.notifications.enabled {
+            if let Some(ref auth) = shared_auth {
+                handler
+                    .install_notification_apps(app_config.api.notifications.clone(), auth.clone());
+            }
         }
     }
 

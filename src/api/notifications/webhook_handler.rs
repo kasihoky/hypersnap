@@ -10,7 +10,8 @@
 //!
 //! See `src/api/notifications/mod.rs` for the wire-level contract.
 
-use crate::api::config::{MiniAppConfig, NotificationsConfig};
+use crate::api::config::NotificationsConfig;
+use crate::api::notifications::app_store::NotificationAppStore;
 use crate::api::notifications::jfs::{verify, ActiveSignerLookup, JfsError};
 use crate::api::notifications::store::NotificationStore;
 use crate::api::notifications::types::{
@@ -21,7 +22,6 @@ use http_body_util::{BodyExt, Full};
 use hyper::body::Bytes;
 use hyper::{Method, Request, Response, StatusCode};
 use serde::Serialize;
-use std::collections::HashMap;
 use std::convert::Infallible;
 use std::sync::Arc;
 use tracing::{debug, warn};
@@ -31,8 +31,10 @@ const MAX_BODY_BYTES: usize = 64 * 1024;
 
 #[derive(Clone)]
 pub struct NotificationWebhookHandler {
-    /// `app_id → MiniAppConfig` (for the optional `signer_fid_allowlist`).
-    apps: Arc<HashMap<String, MiniAppConfig>>,
+    /// Runtime registry of mini apps. Apps are registered at runtime
+    /// through `/v2/farcaster/frame/app/`; the receiver looks them up
+    /// by the `app_id` in the incoming URL path.
+    apps: Arc<NotificationAppStore>,
     store: Arc<NotificationStore>,
     jfs_lookup: Arc<dyn ActiveSignerLookup>,
     ssrf_policy: crate::api::ssrf::SsrfPolicy,
@@ -41,16 +43,12 @@ pub struct NotificationWebhookHandler {
 impl NotificationWebhookHandler {
     pub fn new(
         config: &NotificationsConfig,
+        apps: Arc<NotificationAppStore>,
         store: Arc<NotificationStore>,
         jfs_lookup: Arc<dyn ActiveSignerLookup>,
     ) -> Self {
-        let apps = config
-            .apps
-            .iter()
-            .map(|app| (app.app_id.clone(), app.clone()))
-            .collect();
         Self {
-            apps: Arc::new(apps),
+            apps,
             store,
             jfs_lookup,
             ssrf_policy: config.ssrf_policy(),
@@ -86,9 +84,12 @@ impl NotificationWebhookHandler {
         }
 
         let app = match self.apps.get(&app_id) {
-            Some(a) => a.clone(),
-            None => {
+            Ok(Some(a)) => a,
+            Ok(None) => {
                 return error_response(StatusCode::NOT_FOUND, "unknown app_id");
+            }
+            Err(e) => {
+                return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string());
             }
         };
 
@@ -308,18 +309,66 @@ mod tests {
         .unwrap()
     }
 
-    fn config(apps: Vec<MiniAppConfig>) -> NotificationsConfig {
+    fn config() -> NotificationsConfig {
         NotificationsConfig {
             enabled: true,
-            send_api_key: Some("k".into()),
-            apps,
             send_concurrency: 4,
             dedupe_ttl_secs: 86_400,
             send_timeout_secs: 5,
+            max_apps_per_owner: 25,
+            secret_grace_period_secs: 86_400,
             // Test apply paths use a loopback URL via the test client
             // server, so the SSRF policy must permit loopback.
             allow_loopback_targets: true,
+            admin_api_key: None,
         }
+    }
+
+    /// Register a fresh test app in the in-memory stores and return a
+    /// handler wired up to both. Every app gets a generated base58
+    /// app_id — the caller doesn't care about the value, they just
+    /// reference it back through the returned `RegisteredApp`.
+    fn fresh_handler() -> (
+        TempDir,
+        Arc<NotificationStore>,
+        Arc<crate::api::notifications::NotificationAppStore>,
+        NotificationWebhookHandler,
+    ) {
+        let dir = TempDir::new().unwrap();
+        let db = Arc::new(crate::storage::db::RocksDB::new(
+            dir.path().to_str().unwrap(),
+        ));
+        db.open().unwrap();
+        let store = Arc::new(NotificationStore::new(db.clone()));
+        let apps = Arc::new(crate::api::notifications::NotificationAppStore::new(
+            db.clone(),
+        ));
+        let handler = NotificationWebhookHandler::new(
+            &config(),
+            apps.clone(),
+            store.clone(),
+            Arc::new(AllowAll),
+        );
+        (dir, store, apps, handler)
+    }
+
+    /// Register a test app in the store so the tests below can
+    /// reference it by app_id. No-op signer allowlist so every
+    /// JFS-signed event the fixtures produce is accepted.
+    fn register_test_app(apps: &crate::api::notifications::NotificationAppStore) -> String {
+        let app = crate::api::notifications::RegisteredApp {
+            app_id: crate::api::notifications::generate_app_id(),
+            owner_fid: 1,
+            name: "test".into(),
+            app_url: "https://127.0.0.1/app".into(),
+            description: None,
+            signer_fid_allowlist: vec![],
+            send_secrets: vec![crate::api::notifications::generate_send_secret(0)],
+            created_at: 0,
+            updated_at: 0,
+        };
+        apps.create(&app).unwrap();
+        app.app_id
     }
 
     fn fresh_store() -> (TempDir, Arc<NotificationStore>) {
@@ -358,13 +407,8 @@ mod tests {
     // else `handle` does is straight serde dispatch.
     #[tokio::test]
     async fn apply_added_with_details_upserts_enabled_record() {
-        let (_d, store) = fresh_store();
-        let cfg = config(vec![MiniAppConfig {
-            app_id: "app".into(),
-            app_url: "https://app.example".into(),
-            signer_fid_allowlist: vec![],
-        }]);
-        let handler = NotificationWebhookHandler::new(&cfg, store.clone(), Arc::new(AllowAll));
+        let (_d, store, apps, handler) = fresh_handler();
+        let app_id = register_test_app(&apps);
 
         let payload = MiniappEventPayload {
             event: "miniapp_added".into(),
@@ -376,11 +420,11 @@ mod tests {
             ),
         };
         handler
-            .apply("app", 7, MiniappEventKind::Added, &payload)
+            .apply(&app_id, 7, MiniappEventKind::Added, &payload)
             .await
             .unwrap();
 
-        let stored = store.get("app", 7).unwrap().unwrap();
+        let stored = store.get(&app_id, 7).unwrap().unwrap();
         assert_eq!(stored.url, "https://127.0.0.1/n");
         assert_eq!(stored.token, "tok");
         assert!(stored.enabled);
@@ -388,33 +432,29 @@ mod tests {
 
     #[tokio::test]
     async fn apply_added_without_details_is_a_noop() {
-        let (_d, store) = fresh_store();
-        let cfg = config(vec![MiniAppConfig {
-            app_id: "app".into(),
-            app_url: "https://app.example".into(),
-            signer_fid_allowlist: vec![],
-        }]);
-        let handler = NotificationWebhookHandler::new(&cfg, store.clone(), Arc::new(AllowAll));
+        let (_d, store, apps, handler) = fresh_handler();
+        let app_id = register_test_app(&apps);
 
         let payload = MiniappEventPayload {
             event: "miniapp_added".into(),
             notification_details: None,
         };
         handler
-            .apply("app", 7, MiniappEventKind::Added, &payload)
+            .apply(&app_id, 7, MiniappEventKind::Added, &payload)
             .await
             .unwrap();
 
         // No record should have been created.
-        assert!(store.get("app", 7).unwrap().is_none());
+        assert!(store.get(&app_id, 7).unwrap().is_none());
     }
 
     #[tokio::test]
     async fn apply_notifications_disabled_marks_inactive() {
-        let (_d, store) = fresh_store();
+        let (_d, store, apps, handler) = fresh_handler();
+        let app_id = register_test_app(&apps);
         store
             .upsert(
-                "app",
+                &app_id,
                 7,
                 &NotificationDetails {
                     url: "https://127.0.0.1/n".into(),
@@ -424,37 +464,36 @@ mod tests {
                 },
             )
             .unwrap();
-
-        let cfg = config(vec![MiniAppConfig {
-            app_id: "app".into(),
-            app_url: "https://app.example".into(),
-            signer_fid_allowlist: vec![],
-        }]);
-        let handler = NotificationWebhookHandler::new(&cfg, store.clone(), Arc::new(AllowAll));
 
         let payload = MiniappEventPayload {
             event: "notifications_disabled".into(),
             notification_details: None,
         };
         handler
-            .apply("app", 7, MiniappEventKind::NotificationsDisabled, &payload)
+            .apply(
+                &app_id,
+                7,
+                MiniappEventKind::NotificationsDisabled,
+                &payload,
+            )
             .await
             .unwrap();
 
-        let stored = store.get("app", 7).unwrap().unwrap();
+        let stored = store.get(&app_id, 7).unwrap().unwrap();
         assert!(!stored.enabled);
         let listed = store
-            .enabled_fids_for_url("app", "https://127.0.0.1/n")
+            .enabled_fids_for_url(&app_id, "https://127.0.0.1/n")
             .unwrap();
         assert!(listed.is_empty());
     }
 
     #[tokio::test]
     async fn apply_removed_deletes_record() {
-        let (_d, store) = fresh_store();
+        let (_d, store, apps, handler) = fresh_handler();
+        let app_id = register_test_app(&apps);
         store
             .upsert(
-                "app",
+                &app_id,
                 7,
                 &NotificationDetails {
                     url: "https://127.0.0.1/n".into(),
@@ -464,22 +503,16 @@ mod tests {
                 },
             )
             .unwrap();
-        let cfg = config(vec![MiniAppConfig {
-            app_id: "app".into(),
-            app_url: "https://app.example".into(),
-            signer_fid_allowlist: vec![],
-        }]);
-        let handler = NotificationWebhookHandler::new(&cfg, store.clone(), Arc::new(AllowAll));
 
         let payload = MiniappEventPayload {
             event: "miniapp_removed".into(),
             notification_details: None,
         };
         handler
-            .apply("app", 7, MiniappEventKind::Removed, &payload)
+            .apply(&app_id, 7, MiniappEventKind::Removed, &payload)
             .await
             .unwrap();
-        assert!(store.get("app", 7).unwrap().is_none());
+        assert!(store.get(&app_id, 7).unwrap().is_none());
     }
 
     #[tokio::test]
@@ -487,7 +520,7 @@ mod tests {
         // End-to-end test of the verifier path that doesn't need hyper:
         // build a real signed envelope, run it through `verify`, then
         // hand the decoded payload to `apply`.
-        let (_d, store) = fresh_store();
+        let (_d, store, apps, _) = fresh_handler();
         let key = SigningKey::generate(&mut OsRng);
         let pubkey = key.verifying_key().to_bytes();
         let lookup = Arc::new(AllowList::default());
@@ -513,17 +546,16 @@ mod tests {
         let payload: MiniappEventPayload = serde_json::from_slice(&verified.payload_bytes).unwrap();
         assert_eq!(payload.event, "miniapp_added");
 
-        let cfg = config(vec![MiniAppConfig {
-            app_id: "app".into(),
-            app_url: "https://app.example".into(),
-            signer_fid_allowlist: vec![],
-        }]);
-        let handler = NotificationWebhookHandler::new(&cfg, store.clone(), lookup);
+        // Rebuild the handler against the real AllowList lookup so
+        // JFS verification clears the active-signer check.
+        let handler =
+            NotificationWebhookHandler::new(&config(), apps.clone(), store.clone(), lookup);
+        let app_id = register_test_app(&apps);
         handler
-            .apply("app", verified.fid, MiniappEventKind::Added, &payload)
+            .apply(&app_id, verified.fid, MiniappEventKind::Added, &payload)
             .await
             .unwrap();
-        assert!(store.get("app", 42).unwrap().is_some());
+        assert!(store.get(&app_id, 42).unwrap().is_some());
     }
 
     #[tokio::test]

@@ -920,6 +920,7 @@ mod tests {
             // Tests bind their hyper test server to 127.0.0.1; the
             // SSRF check would otherwise reject every test URL.
             allow_loopback_targets: true,
+            admin_api_key: None,
         }
     }
 

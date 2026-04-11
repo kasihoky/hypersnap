@@ -16,8 +16,8 @@ use crate::api::config::WebhooksConfig;
 use crate::api::webhooks::auth::{AuthError, AuthHeaders, WebhookAuthVerifier};
 use crate::api::webhooks::store::{WebhookStore, WebhookStoreError};
 use crate::api::webhooks::types::{
-    CastFilter, CreateWebhookRequest, UpdateWebhookRequest, Webhook, WebhookListResponse,
-    WebhookOp, WebhookResponse, WebhookSecret, WebhookSubscription,
+    CastFilter, CreateWebhookRequest, SignedOp, UpdateWebhookRequest, Webhook, WebhookListResponse,
+    WebhookResponse, WebhookSecret, WebhookSubscription,
 };
 use alloy_primitives::B256;
 use http_body_util::combinators::BoxBody;
@@ -28,6 +28,7 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::sync::Arc;
+use tracing::info;
 use uuid::Uuid;
 
 const HDR_FID: &str = "x-hypersnap-fid";
@@ -35,8 +36,29 @@ const HDR_OP: &str = "x-hypersnap-op";
 const HDR_SIGNED_AT: &str = "x-hypersnap-signed-at";
 const HDR_NONCE: &str = "x-hypersnap-nonce";
 const HDR_SIGNATURE: &str = "x-hypersnap-signature";
+const HDR_ADMIN_KEY: &str = "x-admin-api-key";
 
 const MAX_BODY_BYTES: usize = 256 * 1024;
+
+/// Upper bound on the number of webhooks an admin list request can
+/// return in one call. Parallels `ADMIN_LIST_CAP` in the notifications
+/// app handler — sized large enough to serve moderation use but small
+/// enough to cap memory/response size.
+const ADMIN_LIST_CAP: usize = 10_000;
+
+/// Who the request is authenticated as. Owner path enforces
+/// `resource.owner_fid == fid`; Admin path bypasses ownership.
+#[derive(Debug, Clone, Copy)]
+enum Authed {
+    Owner(u64),
+    Admin,
+}
+
+impl Authed {
+    fn is_admin(self) -> bool {
+        matches!(self, Authed::Admin)
+    }
+}
 
 /// Routes + manages webhooks. Holds Arc-shared dependencies so it can be
 /// embedded inside the larger `ApiHttpHandler` (which is `Clone`).
@@ -85,12 +107,40 @@ impl WebhookManagementHandler {
         let (parts, body) = req.into_parts();
         let path = parts.uri.path().trim_end_matches('/').to_string();
         let query = parts.uri.query().unwrap_or("").to_string();
+        let method = parts.method.clone();
 
         // Read the raw body up to MAX_BODY_BYTES.
         let body_bytes = match read_body(body).await {
             Ok(bytes) => bytes,
             Err(e) => return error_response(StatusCode::BAD_REQUEST, &e),
         };
+
+        // Admin bypass. Presence of `X-Admin-Api-Key` commits to
+        // admin-mode handling: a mismatch is a hard 401, never a
+        // fall-through to the EIP-712 path. See the corresponding
+        // comment in `NotificationAppHandler::handle` for rationale.
+        if let Some(header) = parts.headers.get(HDR_ADMIN_KEY) {
+            let provided = header.to_str().unwrap_or("");
+            let Some(expected) = self.config.admin_api_key.as_deref() else {
+                return error_response(
+                    StatusCode::UNAUTHORIZED,
+                    "admin mode not enabled on this server",
+                );
+            };
+            if !constant_time_eq(provided.as_bytes(), expected.as_bytes()) {
+                return error_response(StatusCode::UNAUTHORIZED, "invalid X-Admin-Api-Key");
+            }
+            info!(
+                target: "hypersnap::admin",
+                subsystem = "webhooks",
+                method = %method,
+                path = %path,
+                "admin override invoked"
+            );
+            return self
+                .dispatch_admin(method, &path, &query, &body_bytes)
+                .await;
+        }
 
         // Parse auth headers.
         let auth_headers = match parse_auth_headers(&parts.headers) {
@@ -111,28 +161,31 @@ impl WebhookManagementHandler {
         };
 
         let params = parse_query(&query);
+        let owner = Authed::Owner(auth_headers.fid);
 
         // Match the verified op against the actual HTTP method/path so a
         // signed `webhook.create` cannot be replayed against a delete route.
-        match (parts.method.clone(), path.as_str(), verified_op) {
-            (Method::POST, "/v2/farcaster/webhook", WebhookOp::Create) => {
-                self.handle_create(auth_headers.fid, &body_bytes).await
+        match (method, path.as_str(), verified_op) {
+            (Method::POST, "/v2/farcaster/webhook", SignedOp::WebhookCreate) => {
+                self.handle_create(owner, &params, &body_bytes).await
             }
-            (Method::PUT, "/v2/farcaster/webhook", WebhookOp::Update) => {
-                self.handle_update(auth_headers.fid, &body_bytes).await
+            (Method::PUT, "/v2/farcaster/webhook", SignedOp::WebhookUpdate) => {
+                self.handle_update(owner, &body_bytes).await
             }
-            (Method::DELETE, "/v2/farcaster/webhook", WebhookOp::Delete) => {
-                self.handle_delete(auth_headers.fid, &params).await
+            (Method::DELETE, "/v2/farcaster/webhook", SignedOp::WebhookDelete) => {
+                self.handle_delete(owner, &params).await
             }
-            (Method::GET, "/v2/farcaster/webhook", WebhookOp::Read) => {
-                self.handle_lookup(auth_headers.fid, &params).await
+            (Method::GET, "/v2/farcaster/webhook", SignedOp::WebhookRead) => {
+                self.handle_lookup(owner, &params).await
             }
-            (Method::GET, "/v2/farcaster/webhook/list", WebhookOp::Read) => {
-                self.handle_list(auth_headers.fid).await
+            (Method::GET, "/v2/farcaster/webhook/list", SignedOp::WebhookRead) => {
+                self.handle_list(owner, &params).await
             }
-            (Method::POST, "/v2/farcaster/webhook/secret/rotate", WebhookOp::RotateSecret) => {
-                self.handle_rotate_secret(auth_headers.fid, &params).await
-            }
+            (
+                Method::POST,
+                "/v2/farcaster/webhook/secret/rotate",
+                SignedOp::WebhookRotateSecret,
+            ) => self.handle_rotate_secret(owner, &params).await,
             _ => error_response(
                 StatusCode::BAD_REQUEST,
                 "signed op does not match the HTTP method/path",
@@ -140,9 +193,43 @@ impl WebhookManagementHandler {
         }
     }
 
+    /// Admin-mode dispatch — called after `X-Admin-Api-Key` has been
+    /// verified. Matches on (method, path) only, with no EIP-712 op
+    /// check. Every branch passes `Authed::Admin` to the per-op
+    /// handler, which skips ownership checks.
+    async fn dispatch_admin(
+        &self,
+        method: Method,
+        path: &str,
+        query: &str,
+        body: &[u8],
+    ) -> Response<BoxBody<Bytes, Infallible>> {
+        let params = parse_query(query);
+        match (method, path) {
+            (Method::POST, "/v2/farcaster/webhook") => {
+                self.handle_create(Authed::Admin, &params, body).await
+            }
+            (Method::PUT, "/v2/farcaster/webhook") => self.handle_update(Authed::Admin, body).await,
+            (Method::DELETE, "/v2/farcaster/webhook") => {
+                self.handle_delete(Authed::Admin, &params).await
+            }
+            (Method::GET, "/v2/farcaster/webhook") => {
+                self.handle_lookup(Authed::Admin, &params).await
+            }
+            (Method::GET, "/v2/farcaster/webhook/list") => {
+                self.handle_list(Authed::Admin, &params).await
+            }
+            (Method::POST, "/v2/farcaster/webhook/secret/rotate") => {
+                self.handle_rotate_secret(Authed::Admin, &params).await
+            }
+            _ => error_response(StatusCode::BAD_REQUEST, "unknown admin route"),
+        }
+    }
+
     async fn handle_create(
         &self,
-        owner_fid: u64,
+        authed: Authed,
+        params: &HashMap<String, String>,
         body: &[u8],
     ) -> Response<BoxBody<Bytes, Infallible>> {
         let req: CreateWebhookRequest = match serde_json::from_slice(body) {
@@ -150,6 +237,22 @@ impl WebhookManagementHandler {
             Err(e) => {
                 return error_response(StatusCode::BAD_REQUEST, &format!("invalid body: {e}"))
             }
+        };
+
+        // In admin mode the admin must explicitly name the FID the
+        // webhook is being created on behalf of. In owner mode the
+        // owner is the EIP-712-verified FID.
+        let owner_fid = match authed {
+            Authed::Owner(fid) => fid,
+            Authed::Admin => match params.get("owner_fid").and_then(|s| s.parse::<u64>().ok()) {
+                Some(fid) => fid,
+                None => {
+                    return error_response(
+                        StatusCode::BAD_REQUEST,
+                        "admin create requires ?owner_fid=<fid>",
+                    )
+                }
+            },
         };
 
         if let Err(e) = crate::api::ssrf::assert_safe_url(&req.url, self.config.ssrf_policy()).await
@@ -166,16 +269,19 @@ impl WebhookManagementHandler {
             return error_response(StatusCode::BAD_REQUEST, &msg);
         }
 
-        // Per-owner cap.
-        match self.store.count_by_owner(owner_fid) {
-            Ok(count) if count >= self.config.max_webhooks_per_owner => {
-                return error_response(
-                    StatusCode::TOO_MANY_REQUESTS,
-                    "per-FID webhook limit reached",
-                );
+        // Per-owner cap — bypassed for admins so moderation and
+        // seeding can legitimately exceed it.
+        if !authed.is_admin() {
+            match self.store.count_by_owner(owner_fid) {
+                Ok(count) if count >= self.config.max_webhooks_per_owner => {
+                    return error_response(
+                        StatusCode::TOO_MANY_REQUESTS,
+                        "per-FID webhook limit reached",
+                    );
+                }
+                Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+                _ => {}
             }
-            Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
-            _ => {}
         }
 
         let now = current_unix_secs();
@@ -200,12 +306,23 @@ impl WebhookManagementHandler {
             return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string());
         }
 
+        if authed.is_admin() {
+            info!(
+                target: "hypersnap::admin",
+                subsystem = "webhooks",
+                action = "create",
+                webhook_id = %webhook.webhook_id,
+                owner_fid,
+                "admin created webhook"
+            );
+        }
+
         json_response(StatusCode::OK, &WebhookResponse { webhook })
     }
 
     async fn handle_update(
         &self,
-        owner_fid: u64,
+        authed: Authed,
         body: &[u8],
     ) -> Response<BoxBody<Bytes, Infallible>> {
         let req: UpdateWebhookRequest = match serde_json::from_slice(body) {
@@ -221,8 +338,10 @@ impl WebhookManagementHandler {
             Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
         };
 
-        if previous.owner_fid != owner_fid {
-            return error_response(StatusCode::FORBIDDEN, "not the owner of this webhook");
+        if let Authed::Owner(fid) = authed {
+            if previous.owner_fid != fid {
+                return error_response(StatusCode::FORBIDDEN, "not the owner of this webhook");
+            }
         }
 
         let mut next = previous.clone();
@@ -260,12 +379,23 @@ impl WebhookManagementHandler {
             return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string());
         }
 
+        if authed.is_admin() {
+            info!(
+                target: "hypersnap::admin",
+                subsystem = "webhooks",
+                action = "update",
+                webhook_id = %next.webhook_id,
+                owner_fid = next.owner_fid,
+                "admin updated webhook"
+            );
+        }
+
         json_response(StatusCode::OK, &WebhookResponse { webhook: next })
     }
 
     async fn handle_delete(
         &self,
-        owner_fid: u64,
+        authed: Authed,
         params: &HashMap<String, String>,
     ) -> Response<BoxBody<Bytes, Infallible>> {
         let webhook_id = match parse_webhook_id(params) {
@@ -279,12 +409,25 @@ impl WebhookManagementHandler {
             Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
         };
 
-        if webhook.owner_fid != owner_fid {
-            return error_response(StatusCode::FORBIDDEN, "not the owner of this webhook");
+        if let Authed::Owner(fid) = authed {
+            if webhook.owner_fid != fid {
+                return error_response(StatusCode::FORBIDDEN, "not the owner of this webhook");
+            }
         }
 
         if let Err(e) = self.store.delete(&webhook) {
             return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string());
+        }
+
+        if authed.is_admin() {
+            info!(
+                target: "hypersnap::admin",
+                subsystem = "webhooks",
+                action = "delete",
+                webhook_id = %webhook.webhook_id,
+                owner_fid = webhook.owner_fid,
+                "admin deleted webhook"
+            );
         }
 
         json_response(StatusCode::OK, &serde_json::json!({ "deleted": true }))
@@ -292,7 +435,7 @@ impl WebhookManagementHandler {
 
     async fn handle_lookup(
         &self,
-        owner_fid: u64,
+        authed: Authed,
         params: &HashMap<String, String>,
     ) -> Response<BoxBody<Bytes, Infallible>> {
         let webhook_id = match parse_webhook_id(params) {
@@ -301,22 +444,63 @@ impl WebhookManagementHandler {
         };
 
         match self.store.get(&webhook_id) {
-            Ok(Some(w)) if w.owner_fid == owner_fid => {
+            Ok(Some(w)) => {
+                if let Authed::Owner(fid) = authed {
+                    if w.owner_fid != fid {
+                        return error_response(
+                            StatusCode::FORBIDDEN,
+                            "not the owner of this webhook",
+                        );
+                    }
+                }
                 json_response(StatusCode::OK, &WebhookResponse { webhook: w })
             }
-            Ok(Some(_)) => error_response(StatusCode::FORBIDDEN, "not the owner of this webhook"),
             Ok(None) => error_response(StatusCode::NOT_FOUND, "webhook not found"),
             Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
         }
     }
 
-    async fn handle_list(&self, owner_fid: u64) -> Response<BoxBody<Bytes, Infallible>> {
-        match self
-            .store
-            .list_by_owner(owner_fid, self.config.max_webhooks_per_owner)
-        {
-            Ok(webhooks) => json_response(StatusCode::OK, &WebhookListResponse { webhooks }),
-            Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    async fn handle_list(
+        &self,
+        authed: Authed,
+        params: &HashMap<String, String>,
+    ) -> Response<BoxBody<Bytes, Infallible>> {
+        // Resolve target owner:
+        //   - Owner(fid) → always fid; query param is ignored.
+        //   - Admin with `?owner_fid=N` → list for that owner.
+        //   - Admin with no param → list across every owner.
+        let target_owner: Option<u64> = match authed {
+            Authed::Owner(fid) => Some(fid),
+            Authed::Admin => params.get("owner_fid").and_then(|s| s.parse::<u64>().ok()),
+        };
+
+        match target_owner {
+            Some(fid) => {
+                let cap = if authed.is_admin() {
+                    ADMIN_LIST_CAP
+                } else {
+                    self.config.max_webhooks_per_owner
+                };
+                match self.store.list_by_owner(fid, cap) {
+                    Ok(webhooks) => {
+                        json_response(StatusCode::OK, &WebhookListResponse { webhooks })
+                    }
+                    Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+                }
+            }
+            None => match self.store.list_all(ADMIN_LIST_CAP) {
+                Ok(webhooks) => {
+                    info!(
+                        target: "hypersnap::admin",
+                        subsystem = "webhooks",
+                        action = "list_all",
+                        returned = webhooks.len(),
+                        "admin listed all webhooks"
+                    );
+                    json_response(StatusCode::OK, &WebhookListResponse { webhooks })
+                }
+                Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+            },
         }
     }
 
@@ -331,7 +515,7 @@ impl WebhookManagementHandler {
     /// the new secret value out of `webhook.secrets`.
     async fn handle_rotate_secret(
         &self,
-        owner_fid: u64,
+        authed: Authed,
         params: &HashMap<String, String>,
     ) -> Response<BoxBody<Bytes, Infallible>> {
         let webhook_id = match parse_webhook_id(params) {
@@ -345,8 +529,10 @@ impl WebhookManagementHandler {
             Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
         };
 
-        if previous.owner_fid != owner_fid {
-            return error_response(StatusCode::FORBIDDEN, "not the owner of this webhook");
+        if let Authed::Owner(fid) = authed {
+            if previous.owner_fid != fid {
+                return error_response(StatusCode::FORBIDDEN, "not the owner of this webhook");
+            }
         }
 
         let now = current_unix_secs();
@@ -354,6 +540,17 @@ impl WebhookManagementHandler {
 
         if let Err(e) = self.store.update(&previous, &next) {
             return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string());
+        }
+
+        if authed.is_admin() {
+            info!(
+                target: "hypersnap::admin",
+                subsystem = "webhooks",
+                action = "rotate_secret",
+                webhook_id = %next.webhook_id,
+                owner_fid = next.owner_fid,
+                "admin rotated signing secret"
+            );
         }
 
         json_response(StatusCode::OK, &WebhookResponse { webhook: next })
@@ -396,7 +593,7 @@ fn parse_auth_headers(headers: &HeaderMap) -> Result<AuthHeaders, AuthHeaderErro
         .get(HDR_OP)
         .and_then(|v| v.to_str().ok())
         .ok_or(AuthHeaderError::Missing(HDR_OP))?;
-    let op = WebhookOp::parse(op_str).ok_or(AuthHeaderError::Missing(HDR_OP))?;
+    let op = SignedOp::parse(op_str).ok_or(AuthHeaderError::Missing(HDR_OP))?;
 
     let signed_at = headers
         .get(HDR_SIGNED_AT)
@@ -599,6 +796,20 @@ fn json_response<T: Serialize>(
 fn error_response(status: StatusCode, message: &str) -> Response<BoxBody<Bytes, Infallible>> {
     let body = serde_json::json!({ "message": message });
     json_response(status, &body)
+}
+
+/// Byte-wise constant-time equality used for the admin key comparison.
+/// Mirrors the helper in `notifications::send_handler` — duplicated
+/// here so the webhook module stays self-contained.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 impl From<WebhookStoreError> for String {
@@ -833,5 +1044,248 @@ mod tests {
         });
         let err = validate_subscription(&sub).unwrap_err();
         assert!(err.contains("follow_created.target_fids"), "got: {err}");
+    }
+
+    // -------------------- admin override (Phase 8) --------------------
+    //
+    // Parallels the admin tests in
+    // `notifications::app_handler::tests` — exercise the private
+    // handle_* methods directly with `Authed::Admin`.
+
+    use async_trait::async_trait;
+    use tempfile::TempDir;
+
+    struct NeverCalledLookup;
+    #[async_trait]
+    impl crate::api::webhooks::CustodyAddressLookup for NeverCalledLookup {
+        async fn get_custody_address(&self, _fid: u64) -> Option<alloy_primitives::Address> {
+            panic!("custody lookup must not be invoked in admin-mode tests");
+        }
+    }
+
+    fn admin_config() -> WebhooksConfig {
+        WebhooksConfig {
+            enabled: true,
+            max_webhooks_per_owner: 2,
+            delivery_timeout_secs: 5,
+            delivery_concurrency: 4,
+            retry_max_attempts: 3,
+            retry_initial_backoff_ms: 1,
+            signature_header_name: "X-Hypersnap-Signature".into(),
+            default_rate_limit: 1000,
+            default_rate_limit_duration_secs: 60,
+            signed_at_window_secs: 300,
+            secret_grace_period_secs: 86_400,
+            allow_loopback_targets: true,
+            admin_api_key: Some("secret-admin-key".into()),
+        }
+    }
+
+    fn admin_fresh_handler() -> (TempDir, Arc<WebhookStore>, WebhookManagementHandler) {
+        let dir = TempDir::new().unwrap();
+        let db = Arc::new(crate::storage::db::RocksDB::new(
+            dir.path().to_str().unwrap(),
+        ));
+        db.open().unwrap();
+        let store = Arc::new(WebhookStore::new(db));
+        let verifier = WebhookAuthVerifier::new(Arc::new(NeverCalledLookup), 300);
+        let handler = WebhookManagementHandler::new(admin_config(), store.clone(), verifier);
+        (dir, store, handler)
+    }
+
+    fn seed_webhook(store: &WebhookStore, owner: u64) -> Webhook {
+        let w = Webhook {
+            webhook_id: Uuid::new_v4(),
+            owner_fid: owner,
+            target_url: "https://127.0.0.1/x".into(),
+            title: "seeded".into(),
+            description: None,
+            active: true,
+            secrets: vec![WebhookSecret {
+                uid: Uuid::new_v4(),
+                value: "s".into(),
+                expires_at: None,
+                created_at: 0,
+            }],
+            subscription: WebhookSubscription {
+                cast_created: Some(CastFilter::default()),
+                ..Default::default()
+            },
+            http_timeout: 5,
+            rate_limit: 1000,
+            rate_limit_duration: 60,
+            created_at: 0,
+            updated_at: 0,
+            deleted_at: None,
+        };
+        store.create(&w).unwrap();
+        w
+    }
+
+    async fn body_to_json(resp: Response<BoxBody<Bytes, Infallible>>) -> serde_json::Value {
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn admin_create_requires_owner_fid_param() {
+        let (_d, _store, handler) = admin_fresh_handler();
+        let body =
+            br#"{"name":"a","url":"https://127.0.0.1/x","subscription":{"cast_created":{}}}"#;
+        let resp = handler
+            .handle_create(Authed::Admin, &HashMap::new(), body)
+            .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn admin_create_with_owner_fid_succeeds() {
+        let (_d, store, handler) = admin_fresh_handler();
+        let body = br#"{"name":"admin-made","url":"https://127.0.0.1/x","subscription":{"cast_created":{}}}"#;
+        let mut params = HashMap::new();
+        params.insert("owner_fid".to_string(), "42".to_string());
+
+        let resp = handler.handle_create(Authed::Admin, &params, body).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_to_json(resp).await;
+        let id = Uuid::parse_str(v["webhook"]["webhook_id"].as_str().unwrap()).unwrap();
+        let stored = store.get(&id).unwrap().unwrap();
+        assert_eq!(stored.owner_fid, 42);
+    }
+
+    #[tokio::test]
+    async fn admin_create_bypasses_per_owner_cap() {
+        let (_d, store, handler) = admin_fresh_handler();
+        seed_webhook(&store, 42);
+        seed_webhook(&store, 42);
+        assert_eq!(store.count_by_owner(42).unwrap(), 2);
+
+        let body =
+            br#"{"name":"third","url":"https://127.0.0.1/x","subscription":{"cast_created":{}}}"#;
+        let mut params = HashMap::new();
+        params.insert("owner_fid".to_string(), "42".to_string());
+        let resp = handler.handle_create(Authed::Admin, &params, body).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(store.count_by_owner(42).unwrap(), 3);
+    }
+
+    #[tokio::test]
+    async fn owner_create_still_enforces_cap() {
+        let (_d, store, handler) = admin_fresh_handler();
+        seed_webhook(&store, 42);
+        seed_webhook(&store, 42);
+
+        let body =
+            br#"{"name":"third","url":"https://127.0.0.1/x","subscription":{"cast_created":{}}}"#;
+        let resp = handler
+            .handle_create(Authed::Owner(42), &HashMap::new(), body)
+            .await;
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn admin_lookup_bypasses_ownership() {
+        let (_d, store, handler) = admin_fresh_handler();
+        let w = seed_webhook(&store, 42);
+        let mut params = HashMap::new();
+        params.insert("webhook_id".to_string(), w.webhook_id.to_string());
+
+        let resp = handler.handle_lookup(Authed::Admin, &params).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let resp = handler.handle_lookup(Authed::Owner(999), &params).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn admin_delete_bypasses_ownership() {
+        let (_d, store, handler) = admin_fresh_handler();
+        let w = seed_webhook(&store, 42);
+        let mut params = HashMap::new();
+        params.insert("webhook_id".to_string(), w.webhook_id.to_string());
+
+        let resp = handler.handle_delete(Authed::Admin, &params).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(store.get(&w.webhook_id).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn admin_rotate_secret_bypasses_ownership() {
+        let (_d, store, handler) = admin_fresh_handler();
+        let w = seed_webhook(&store, 42);
+        let before = store.get(&w.webhook_id).unwrap().unwrap();
+        assert_eq!(before.secrets.len(), 1);
+
+        let mut params = HashMap::new();
+        params.insert("webhook_id".to_string(), w.webhook_id.to_string());
+        let resp = handler.handle_rotate_secret(Authed::Admin, &params).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let after = store.get(&w.webhook_id).unwrap().unwrap();
+        assert_eq!(after.secrets.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn admin_list_all_returns_across_owners() {
+        let (_d, store, handler) = admin_fresh_handler();
+        seed_webhook(&store, 1);
+        seed_webhook(&store, 2);
+        seed_webhook(&store, 3);
+
+        let resp = handler.handle_list(Authed::Admin, &HashMap::new()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_to_json(resp).await;
+        let listed = v["webhooks"].as_array().unwrap();
+        assert_eq!(listed.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn admin_list_with_owner_fid_filters() {
+        let (_d, store, handler) = admin_fresh_handler();
+        seed_webhook(&store, 1);
+        seed_webhook(&store, 1);
+        seed_webhook(&store, 2);
+
+        let mut params = HashMap::new();
+        params.insert("owner_fid".to_string(), "1".to_string());
+        let resp = handler.handle_list(Authed::Admin, &params).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_to_json(resp).await;
+        let listed = v["webhooks"].as_array().unwrap();
+        assert_eq!(listed.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn owner_list_ignores_admin_query_param() {
+        let (_d, store, handler) = admin_fresh_handler();
+        seed_webhook(&store, 1);
+        seed_webhook(&store, 2);
+
+        // Non-admin supplies `?owner_fid=2` but must only see their own.
+        let mut params = HashMap::new();
+        params.insert("owner_fid".to_string(), "2".to_string());
+        let resp = handler.handle_list(Authed::Owner(1), &params).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_to_json(resp).await;
+        let listed = v["webhooks"].as_array().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0]["owner_fid"].as_u64(), Some(1));
+    }
+
+    #[tokio::test]
+    async fn admin_dispatch_rejects_unknown_route() {
+        let (_d, _store, handler) = admin_fresh_handler();
+        let resp = handler
+            .dispatch_admin(Method::GET, "/v2/farcaster/nonsense", "", b"")
+            .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn constant_time_eq_basic() {
+        assert!(constant_time_eq(b"abc", b"abc"));
+        assert!(!constant_time_eq(b"abc", b"abd"));
+        assert!(!constant_time_eq(b"abc", b"abcd"));
+        assert!(constant_time_eq(b"", b""));
     }
 }

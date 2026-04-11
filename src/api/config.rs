@@ -413,6 +413,18 @@ pub struct WebhooksConfig {
     /// internal ranges are still blocked even with this set.
     #[serde(default)]
     pub allow_loopback_targets: bool,
+
+    /// Operator-level bearer token. Requests that present a matching
+    /// `X-Admin-Api-Key` header bypass the EIP-712 custody signature
+    /// check and can operate on any webhook regardless of owner —
+    /// used for support cases ("user lost their custody key") and
+    /// abuse cleanup. **Treat as a root credential**: rotate out-of-band
+    /// by editing config and restarting, and keep it off any shared
+    /// log path. When `None`, the admin code path is compiled out at
+    /// runtime — no request can ever reach it, so the default posture
+    /// is "admin override disabled."
+    #[serde(default)]
+    pub admin_api_key: Option<String>,
 }
 
 impl Default for WebhooksConfig {
@@ -430,6 +442,7 @@ impl Default for WebhooksConfig {
             signed_at_window_secs: default_signed_at_window_secs(),
             secret_grace_period_secs: default_secret_grace_period_secs(),
             allow_loopback_targets: false,
+            admin_api_key: None,
         }
     }
 }
@@ -485,21 +498,16 @@ fn default_secret_grace_period_secs() -> u64 {
 /// stores `(fid, notification_url, token)` and exposes a send endpoint
 /// that fans out to client notification URLs in batches.
 ///
+/// Mini apps are registered **at runtime** through the signed management
+/// API (`/v2/farcaster/frame/app/`) rather than in config. The config
+/// section only controls feature-flag + global defaults.
+///
 /// See `src/api/notifications/mod.rs` for the wire format.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct NotificationsConfig {
     /// Whether the notification system is enabled.
     #[serde(default)]
     pub enabled: bool,
-
-    /// API key required to call the send endpoint (header `x-api-key`).
-    /// If `None`, the send endpoint is disabled.
-    #[serde(default)]
-    pub send_api_key: Option<String>,
-
-    /// Mini apps registered for notification delivery.
-    #[serde(default)]
-    pub apps: Vec<MiniAppConfig>,
 
     /// Maximum concurrent fan-out POSTs.
     #[serde(default = "default_send_concurrency")]
@@ -513,12 +521,32 @@ pub struct NotificationsConfig {
     #[serde(default = "default_send_timeout_secs")]
     pub send_timeout_secs: u64,
 
+    /// Maximum mini apps any single FID may register (per-owner cap).
+    #[serde(default = "default_max_apps_per_owner")]
+    pub max_apps_per_owner: usize,
+
+    /// Grace period after `app.rotate_secret` during which the previous
+    /// send secret remains valid. Default 24 h.
+    #[serde(default = "default_app_secret_grace_period_secs")]
+    pub secret_grace_period_secs: u64,
+
     /// Permit notification URLs to resolve to loopback addresses
     /// (`127.0.0.0/8`, `::1`). Off by default; only enable for local
     /// development against a notification receiver running on the
     /// same host.
     #[serde(default)]
     pub allow_loopback_targets: bool,
+
+    /// Operator-level bearer token. Requests that present a matching
+    /// `X-Admin-Api-Key` header bypass the EIP-712 custody signature
+    /// check on `/v2/farcaster/frame/app/*` and can operate on any
+    /// mini app regardless of owner. Same trust model as
+    /// `webhooks.admin_api_key`: treat as a root credential, rotate
+    /// out-of-band. `None` disables admin mode entirely — the check
+    /// is compiled into the request path but the comparison never
+    /// matches since there's no configured key.
+    #[serde(default)]
+    pub admin_api_key: Option<String>,
 }
 
 impl NotificationsConfig {
@@ -537,30 +565,15 @@ impl Default for NotificationsConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            send_api_key: None,
-            apps: Vec::new(),
             send_concurrency: default_send_concurrency(),
             dedupe_ttl_secs: default_dedupe_ttl_secs(),
             send_timeout_secs: default_send_timeout_secs(),
+            max_apps_per_owner: default_max_apps_per_owner(),
+            secret_grace_period_secs: default_app_secret_grace_period_secs(),
             allow_loopback_targets: false,
+            admin_api_key: None,
         }
     }
-}
-
-/// A registered mini app for which Hypersnap proxies notifications.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct MiniAppConfig {
-    /// Stable identifier used in the URL path: `/v2/farcaster/frame/webhook/<app_id>`
-    /// and `/v2/farcaster/frame/notifications/<app_id>`.
-    pub app_id: String,
-
-    /// Mini app's canonical URL (used for logging and validation only).
-    pub app_url: String,
-
-    /// Optional allowlist of signer FIDs whose JFS-signed events we accept.
-    /// If empty, any valid signer is accepted.
-    #[serde(default)]
-    pub signer_fid_allowlist: Vec<u64>,
 }
 
 fn default_send_concurrency() -> usize {
@@ -571,6 +584,12 @@ fn default_dedupe_ttl_secs() -> u64 {
 }
 fn default_send_timeout_secs() -> u64 {
     10
+}
+fn default_max_apps_per_owner() -> usize {
+    25
+}
+fn default_app_secret_grace_period_secs() -> u64 {
+    86_400
 }
 
 #[cfg(test)]

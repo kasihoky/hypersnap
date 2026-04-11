@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
 
-use crate::api::webhooks::types::WebhookOp;
+use crate::api::webhooks::types::SignedOp;
 
 /// Trait for resolving the current custody address of an FID.
 ///
@@ -31,7 +31,7 @@ pub trait CustodyAddressLookup: Send + Sync {
 #[derive(Debug, Clone)]
 pub struct AuthHeaders {
     pub fid: u64,
-    pub op: WebhookOp,
+    pub op: SignedOp,
     pub signed_at: u64,
     pub nonce: B256,
     pub signature: [u8; 65],
@@ -90,7 +90,7 @@ impl WebhookAuthVerifier {
         &self,
         headers: &AuthHeaders,
         body_bytes: &[u8],
-    ) -> Result<(u64, WebhookOp), AuthError> {
+    ) -> Result<(u64, SignedOp), AuthError> {
         // 1. Clock skew.
         let now = current_unix_secs();
         let skew = now.abs_diff(headers.signed_at);
@@ -115,7 +115,7 @@ impl WebhookAuthVerifier {
                     { "name": "version", "type": "string"  },
                     { "name": "chainId", "type": "uint256" },
                 ],
-                "WebhookOperation": [
+                "HypersnapSignedOp": [
                     { "name": "op",          "type": "string"  },
                     { "name": "fid",         "type": "uint64"  },
                     { "name": "signedAt",    "type": "uint256" },
@@ -123,7 +123,7 @@ impl WebhookAuthVerifier {
                     { "name": "requestHash", "type": "bytes32" },
                 ],
             },
-            "primaryType": "WebhookOperation",
+            "primaryType": "HypersnapSignedOp",
             "domain": {
                 "name": "Hypersnap",
                 "version": "1",
@@ -203,7 +203,7 @@ mod tests {
     }
 
     fn build_typed_data(
-        op: WebhookOp,
+        op: SignedOp,
         fid: u64,
         signed_at: u64,
         nonce: B256,
@@ -217,7 +217,7 @@ mod tests {
                     { "name": "version", "type": "string"  },
                     { "name": "chainId", "type": "uint256" },
                 ],
-                "WebhookOperation": [
+                "HypersnapSignedOp": [
                     { "name": "op",          "type": "string"  },
                     { "name": "fid",         "type": "uint64"  },
                     { "name": "signedAt",    "type": "uint256" },
@@ -225,7 +225,7 @@ mod tests {
                     { "name": "requestHash", "type": "bytes32" },
                 ],
             },
-            "primaryType": "WebhookOperation",
+            "primaryType": "HypersnapSignedOp",
             "domain": {
                 "name": "Hypersnap",
                 "version": "1",
@@ -261,12 +261,12 @@ mod tests {
         let body = br#"{"name":"my hook","url":"https://example.com/h"}"#;
         let signed_at = current_unix_secs();
         let nonce = B256::repeat_byte(0xab);
-        let typed = build_typed_data(WebhookOp::Create, 7, signed_at, nonce, body);
+        let typed = build_typed_data(SignedOp::WebhookCreate, 7, signed_at, nonce, body);
         let signature = sign(&signer, &typed);
 
         let headers = AuthHeaders {
             fid: 7,
-            op: WebhookOp::Create,
+            op: SignedOp::WebhookCreate,
             signed_at,
             nonce,
             signature,
@@ -274,7 +274,7 @@ mod tests {
 
         let (fid, op) = verifier.verify(&headers, body).await.unwrap();
         assert_eq!(fid, 7);
-        assert_eq!(op, WebhookOp::Create);
+        assert_eq!(op, SignedOp::WebhookCreate);
     }
 
     #[tokio::test]
@@ -290,12 +290,12 @@ mod tests {
         let body = b"{}";
         let signed_at = current_unix_secs();
         let nonce = B256::repeat_byte(0xcd);
-        let typed = build_typed_data(WebhookOp::Create, 7, signed_at, nonce, body);
+        let typed = build_typed_data(SignedOp::WebhookCreate, 7, signed_at, nonce, body);
         let signature = sign(&imposter, &typed);
 
         let headers = AuthHeaders {
             fid: 7,
-            op: WebhookOp::Create,
+            op: SignedOp::WebhookCreate,
             signed_at,
             nonce,
             signature,
@@ -318,12 +318,12 @@ mod tests {
         let body = b"x";
         let signed_at = current_unix_secs();
         let nonce = B256::repeat_byte(0xee);
-        let typed = build_typed_data(WebhookOp::Create, 9, signed_at, nonce, body);
+        let typed = build_typed_data(SignedOp::WebhookCreate, 9, signed_at, nonce, body);
         let signature = sign(&signer, &typed);
 
         let headers = AuthHeaders {
             fid: 9,
-            op: WebhookOp::Create,
+            op: SignedOp::WebhookCreate,
             signed_at,
             nonce,
             signature,
@@ -348,12 +348,12 @@ mod tests {
         let body = b"x";
         let signed_at = current_unix_secs() - 600;
         let nonce = B256::repeat_byte(0x11);
-        let typed = build_typed_data(WebhookOp::Create, 9, signed_at, nonce, body);
+        let typed = build_typed_data(SignedOp::WebhookCreate, 9, signed_at, nonce, body);
         let signature = sign(&signer, &typed);
 
         let headers = AuthHeaders {
             fid: 9,
-            op: WebhookOp::Create,
+            op: SignedOp::WebhookCreate,
             signed_at,
             nonce,
             signature,
@@ -376,12 +376,12 @@ mod tests {
         let body = b"x";
         let signed_at = current_unix_secs();
         let nonce = B256::repeat_byte(0x22);
-        let typed = build_typed_data(WebhookOp::Create, 999, signed_at, nonce, body);
+        let typed = build_typed_data(SignedOp::WebhookCreate, 999, signed_at, nonce, body);
         let signature = sign(&signer, &typed);
 
         let headers = AuthHeaders {
             fid: 999,
-            op: WebhookOp::Create,
+            op: SignedOp::WebhookCreate,
             signed_at,
             nonce,
             signature,
@@ -404,13 +404,13 @@ mod tests {
         let body = b"original body";
         let signed_at = current_unix_secs();
         let nonce = B256::repeat_byte(0x33);
-        let typed = build_typed_data(WebhookOp::Create, 5, signed_at, nonce, body);
+        let typed = build_typed_data(SignedOp::WebhookCreate, 5, signed_at, nonce, body);
         let signature = sign(&signer, &typed);
 
         // Send a tampered body to the verifier — same headers, different bytes.
         let headers = AuthHeaders {
             fid: 5,
-            op: WebhookOp::Create,
+            op: SignedOp::WebhookCreate,
             signed_at,
             nonce,
             signature,

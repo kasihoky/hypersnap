@@ -96,6 +96,11 @@ pub struct ApiSystem {
     pub http_handler: ApiHttpHandler,
     /// Search indexer (if enabled), for wiring into the HTTP handler.
     pub search_indexer: Option<Arc<SearchIndexer>>,
+    /// Runtime mini-app registry. Exposed so `main.rs` can build the
+    /// app-management handler once the custody lookup is available.
+    pub notification_app_store: Option<Arc<crate::api::notifications::NotificationAppStore>>,
+    /// Per-user notification token store. Exposed for the same reason.
+    pub notification_token_store: Option<Arc<crate::api::notifications::NotificationStore>>,
 }
 
 impl ApiSystem {
@@ -165,7 +170,7 @@ pub fn initialize(
     // task below. All shards see the same on-chain events so any one is
     // sufficient.
     let jfs_signer_store: Option<crate::storage::store::account::OnchainEventStore> =
-        if config.notifications.enabled && !config.notifications.apps.is_empty() {
+        if config.notifications.enabled {
             shard_stores
                 .values()
                 .next()
@@ -182,10 +187,6 @@ pub fn initialize(
         "Initializing Farcaster indexing system with {} shards",
         hub_event_senders.len()
     );
-
-    if config.notifications.enabled && config.notifications.apps.is_empty() {
-        tracing::warn!("notifications.enabled = true but no apps configured; nothing to do");
-    }
 
     let (index_tx, index_rx) = create_index_channel(DEFAULT_CHANNEL_CAPACITY);
 
@@ -453,29 +454,45 @@ pub fn initialize(
         Some(cast_hash_indexer),
     );
 
-    // Mini app notification token receiver + send endpoint. The token
-    // receiver depends on the on-chain event store (cloned above); the
-    // send endpoint optionally uses the social_graph indexer for the
-    // `following_fid` filter. Both share one `NotificationStore`.
-    if config.notifications.enabled && !config.notifications.apps.is_empty() {
+    // Mini app notifications — two stateful HTTP handlers wired here,
+    // one more (the registration management handler) wired from
+    // main.rs once the custody lookup is available.
+    //
+    // - The webhook **receiver** at `/v2/farcaster/frame/webhook/<app_id>`
+    //   accepts JFS-signed token registration events. Needs the
+    //   on-chain event store for active-signer lookup (cloned above).
+    // - The **send** endpoint at `/v2/farcaster/frame/notifications/<app_id>`
+    //   fans out notifications. Needs the social_graph indexer for
+    //   the optional `following_fid` filter.
+    //
+    // Both handlers share one `NotificationAppStore` (runtime registry
+    // of all mini apps) and one `NotificationStore` (per-user token
+    // records). The registration management handler is set later
+    // from main.rs once the custody-address lookup is available.
+    let (notification_app_store, notification_token_store) = if config.notifications.enabled {
         if let Some(onchain_store) = jfs_signer_store {
             let lookup: Arc<dyn crate::api::notifications::ActiveSignerLookup> = Arc::new(
                 crate::api::notifications::OnchainSignerLookup::new(onchain_store),
             );
-            let store = Arc::new(crate::api::notifications::NotificationStore::new(
+            let token_store = Arc::new(crate::api::notifications::NotificationStore::new(
+                db.clone(),
+            ));
+            let app_store = Arc::new(crate::api::notifications::NotificationAppStore::new(
                 db.clone(),
             ));
 
             let webhook_handler = crate::api::notifications::NotificationWebhookHandler::new(
                 &config.notifications,
-                store.clone(),
+                app_store.clone(),
+                token_store.clone(),
                 lookup,
             );
             http_handler.set_notification_webhooks(webhook_handler);
 
             let send_handler = crate::api::notifications::NotificationSendHandler::new(
                 config.notifications.clone(),
-                store,
+                app_store.clone(),
+                token_store.clone(),
                 // The send handler created here is constructed before
                 // social_graph_indexer's late-binding from main.rs is
                 // possible, so we pass the indexer directly when it's
@@ -491,17 +508,24 @@ pub fn initialize(
             );
             http_handler.set_notification_sender(send_handler);
 
+            // Stash the stores on the handler so main.rs can call
+            // `install_notification_apps` once the custody lookup is
+            // available.
+            http_handler.set_notification_stores(app_store.clone(), token_store.clone());
+
             tracing::info!(
-                apps = config.notifications.apps.len(),
-                send_api_key_configured = config.notifications.send_api_key.is_some(),
-                "mini app notifications wired (receiver + send endpoint)"
+                "mini app notifications wired (receiver + send endpoint); app management set from main.rs once custody lookup is ready"
             );
+            (Some(app_store), Some(token_store))
         } else {
             tracing::warn!(
                 "notifications.enabled = true but no shard stores were provided; cannot wire JFS lookup"
             );
+            (None, None)
         }
-    }
+    } else {
+        (None, None)
+    };
 
     Some(ApiSystem {
         worker_handle,
@@ -514,6 +538,8 @@ pub fn initialize(
         shutdown_tx,
         http_handler,
         search_indexer,
+        notification_app_store,
+        notification_token_store,
     })
 }
 
