@@ -2517,10 +2517,21 @@ impl HubService for MyHubService {
 
 #[tonic::async_trait]
 impl crate::api::HubQueryHandler for MyHubService {
-    async fn get_cast_by_hash(&self, hash: &[u8]) -> Option<Message> {
-        // Iterate all registered FIDs across all shards and do a direct
-        // RocksDB lookup for each. Each get_cast_add is a single RocksDB
-        // get (O(1)), so total cost is O(num_fids).
+    async fn get_cast_by_hash(&self, hash: &[u8], fid_hint: Option<u64>) -> Option<Message> {
+        // Fast path: if caller provides the FID (from cast_hash_index), do
+        // a single O(1) RocksDB get on the correct shard.
+        if let Some(fid) = fid_hint {
+            if let Ok(stores) = self.get_stores_for(fid) {
+                if let Ok(Some(msg)) =
+                    CastStore::get_cast_add(&stores.cast_store, fid, hash.to_vec())
+                {
+                    return Some(msg);
+                }
+            }
+        }
+
+        // Slow fallback: scan all shards. Only reached when no FID hint
+        // is available (e.g. cast_hash_index hasn't backfilled yet).
         for stores in self.shard_stores.values() {
             let mut page_token: Option<Vec<u8>> = None;
             loop {
@@ -2583,7 +2594,7 @@ impl crate::api::HubQueryHandler for MyHubService {
         // First find the cast FID by scanning events.
         let mut cast_fid = _fid;
         if cast_fid == 0 {
-            if let Some(msg) = self.get_cast_by_hash(hash).await {
+            if let Some(msg) = self.get_cast_by_hash(hash, None).await {
                 if let Some(data) = &msg.data {
                     cast_fid = data.fid;
                 }
@@ -2848,6 +2859,25 @@ impl crate::api::HubQueryHandler for MyHubService {
         )
         .map_err(|e| format!("{:?}", e))?;
         Ok(page.messages)
+    }
+
+    async fn get_casts_by_mention(&self, fid: u64, limit: usize) -> Result<Vec<Message>, String> {
+        let mut all_messages = Vec::new();
+        for stores in self.shard_stores.values() {
+            let options = PageOptions {
+                page_size: Some(limit),
+                page_token: None,
+                reverse: true,
+            };
+            if let Ok(page) = CastStore::get_casts_by_mention(&stores.cast_store, fid, &options) {
+                all_messages.extend(page.messages);
+            }
+            if all_messages.len() >= limit {
+                break;
+            }
+        }
+        all_messages.truncate(limit);
+        Ok(all_messages)
     }
 
     async fn get_user_data_value(&self, fid: u64, data_type: i32) -> Option<String> {

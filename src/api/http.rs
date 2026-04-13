@@ -76,8 +76,14 @@ pub trait UserHydrator: Send + Sync {
 /// Provides type-erased access to hub data for cast lookups, reactions, etc.
 #[async_trait]
 pub trait HubQueryHandler: Send + Sync {
-    /// Look up a single cast by hash (scans all shards).
-    async fn get_cast_by_hash(&self, hash: &[u8]) -> Option<crate::proto::Message>;
+    /// Look up a single cast by hash.
+    /// When `fid_hint` is provided, does a direct O(1) RocksDB lookup.
+    /// When `None`, falls back to scanning shards.
+    async fn get_cast_by_hash(
+        &self,
+        hash: &[u8],
+        fid_hint: Option<u64>,
+    ) -> Option<crate::proto::Message>;
 
     /// Get casts by FID with pagination.
     async fn get_casts_by_fid(
@@ -145,6 +151,13 @@ pub trait HubQueryHandler: Send + Sync {
 
     /// Get user data messages for a FID.
     async fn get_user_data_by_fid(&self, fid: u64) -> Result<Vec<crate::proto::Message>, String>;
+
+    /// Get casts that mention a specific FID.
+    async fn get_casts_by_mention(
+        &self,
+        fid: u64,
+        limit: usize,
+    ) -> Result<Vec<crate::proto::Message>, String>;
 
     /// Get a specific user data value by type.
     async fn get_user_data_value(&self, fid: u64, data_type: i32) -> Option<String>;
@@ -1935,21 +1948,16 @@ impl ApiHttpHandler {
             }
         };
 
-        // Use cast hash index for O(1) FID resolution, then direct hub lookup
-        let resolved_fid = fid.or_else(|| {
+        // Resolve FID via index for O(1) lookup
+        let fid_hint = fid.or_else(|| {
             self.cast_hash_index
                 .as_ref()
                 .and_then(|idx| idx.get_fid_by_hash(&hash))
         });
 
-        if let Some(resolved_fid) = resolved_fid {
-            // Direct lookup by FID + hash (fast)
-            if let Ok((casts, _)) = hub.get_casts_by_fid(resolved_fid, 100, None, false).await {
-                if let Some(msg) = casts.into_iter().find(|c| c.hash == hash) {
-                    let cast = self.message_to_cast(&msg).await;
-                    return Ok(Self::json_response(StatusCode::OK, &CastResponse { cast }));
-                }
-            }
+        if let Some(msg) = hub.get_cast_by_hash(&hash, fid_hint).await {
+            let cast = self.message_to_cast(&msg).await;
+            return Ok(Self::json_response(StatusCode::OK, &CastResponse { cast }));
         }
 
         Ok(Self::error_response(
@@ -1975,17 +1983,12 @@ impl ApiHttpHandler {
         for hash_str in hashes_str.split(',') {
             let hash_str = hash_str.trim().trim_start_matches("0x");
             if let Ok(hash) = hex::decode(hash_str) {
-                // Use cast hash index for O(1) FID resolution
-                let fid = self
+                let fid_hint = self
                     .cast_hash_index
                     .as_ref()
                     .and_then(|idx| idx.get_fid_by_hash(&hash));
-                if let Some(fid) = fid {
-                    if let Ok((found, _)) = hub.get_casts_by_fid(fid, 100, None, false).await {
-                        if let Some(msg) = found.into_iter().find(|c| c.hash == hash) {
-                            casts.push(self.message_to_cast(&msg).await);
-                        }
-                    }
+                if let Some(msg) = hub.get_cast_by_hash(&hash, fid_hint).await {
+                    casts.push(self.message_to_cast(&msg).await);
                 }
             }
         }
@@ -3015,10 +3018,8 @@ impl ApiHttpHandler {
                 let hub = self.hub_query.read().unwrap().clone();
                 if let Some(hub) = hub {
                     for (fid, qhash) in &quotes {
-                        if let Ok((found, _)) = hub.get_casts_by_fid(*fid, 100, None, false).await {
-                            if let Some(msg) = found.into_iter().find(|c| c.hash == *qhash) {
-                                casts.push(self.message_to_cast(&msg).await);
-                            }
+                        if let Some(msg) = hub.get_cast_by_hash(qhash, Some(*fid)).await {
+                            casts.push(self.message_to_cast(&msg).await);
                         }
                     }
                 }
@@ -3263,18 +3264,17 @@ impl ApiHttpHandler {
             ));
         }
 
-        // Count mentions of target in fid's casts, and reactions from fid on target's casts
+        // Count mentions of target in fid's casts (via mention index),
+        // and reactions from fid on target's casts
         let mut mentions = 0u64;
         let mut reactions = 0u64;
 
-        // Check fid's casts for mentions of target
-        if let Ok((casts, _)) = hub.get_casts_by_fid(fid, 500, None, false).await {
-            for msg in &casts {
+        // Use mention index: get casts that mention target, filter to those by fid
+        if let Ok(mention_casts) = hub.get_casts_by_mention(target, 500).await {
+            for msg in &mention_casts {
                 if let Some(data) = &msg.data {
-                    if let Some(crate::proto::message_data::Body::CastAddBody(body)) = &data.body {
-                        if body.mentions.contains(&target) {
-                            mentions += 1;
-                        }
+                    if data.fid == fid {
+                        mentions += 1;
                     }
                 }
             }
