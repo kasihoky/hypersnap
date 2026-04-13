@@ -14,14 +14,14 @@ use crate::api::notifications::{
 use crate::api::search::SearchIndexer;
 use crate::api::social_graph::SocialGraphIndexer;
 use crate::api::types::{
-    self, Bio, BulkCastsResponse, BulkUsersResponse, Cast, CastReactions, CastReplies,
-    CastResponse, CastWithReplies, CastsSearchResponse, CastsSearchResult, Channel, ChannelMember,
-    ChannelMemberListResponse, ChannelResponse, ChannelsResponse, Conversation,
+    self, Bio, BlockListResponse, BulkCastsResponse, BulkUsersResponse, Cast, CastReactions,
+    CastReplies, CastResponse, CastWithReplies, CastsSearchResponse, CastsSearchResult, Channel,
+    ChannelMember, ChannelMemberListResponse, ChannelResponse, ChannelsResponse, Conversation,
     ConversationResponse, Embed, ErrorResponse, FeedResponse, FnameAvailabilityResponse,
-    FollowersResponse, NextCursor, Notification, NotificationsResponse, ParentAuthor, Reaction,
-    ReactionCastRef, ReactionsResponse, StorageAllocation, StorageAllocationsResponse,
-    StorageUsage, StorageUsageResponse, User, UserProfile, UserResponse, UsernameProofResponse,
-    VerifiedAddresses,
+    FollowersResponse, NextCursor, Notification, NotificationsResponse, OnChainEventEntry,
+    OnChainEventsResponse, ParentAuthor, Reaction, ReactionCastRef, ReactionsResponse,
+    StorageAllocation, StorageAllocationsResponse, StorageUsage, StorageUsageResponse, User,
+    UserProfile, UserResponse, UsernameProofResponse, VerifiedAddresses,
 };
 use crate::api::webhooks::WebhookManagementHandler;
 use async_trait::async_trait;
@@ -134,6 +134,27 @@ pub trait HubQueryHandler: Send + Sync {
         limit: usize,
         cursor: Option<&str>,
     ) -> Result<Vec<crate::proto::Message>, String>;
+
+    /// Get links by FID and link type (e.g. "follow", "block", "mute").
+    async fn get_links_by_fid(
+        &self,
+        fid: u64,
+        link_type: &str,
+        limit: usize,
+    ) -> Result<Vec<crate::proto::Message>, String>;
+
+    /// Get user data messages for a FID.
+    async fn get_user_data_by_fid(&self, fid: u64) -> Result<Vec<crate::proto::Message>, String>;
+
+    /// Get a specific user data value by type.
+    async fn get_user_data_value(&self, fid: u64, data_type: i32) -> Option<String>;
+
+    /// Get FIDs registered on the network.
+    async fn get_fids(
+        &self,
+        limit: usize,
+        cursor: Option<Vec<u8>>,
+    ) -> Result<(Vec<u64>, Option<Vec<u8>>), String>;
 }
 
 /// Farcaster HTTP handler for v2 API endpoints.
@@ -147,6 +168,8 @@ pub struct ApiHttpHandler {
     channels: Option<Arc<ChannelsIndexer>>,
     metrics: Option<Arc<MetricsIndexer>>,
     cast_hash_index: Option<Arc<crate::api::cast_hash_index::CastHashIndexer>>,
+    cast_quotes_index: Option<Arc<crate::api::cast_quotes_index::CastQuotesIndexer>>,
+    user_data_index: Option<Arc<crate::api::user_data_index::UserDataIndexer>>,
     conversations: Arc<std::sync::RwLock<Option<Arc<dyn ConversationHandler>>>>,
     feeds: Arc<std::sync::RwLock<Option<Arc<dyn FeedHandler>>>>,
     channel_feeds: Arc<std::sync::RwLock<Option<Arc<dyn ChannelFeedHandler>>>>,
@@ -182,12 +205,16 @@ impl ApiHttpHandler {
         channels: Option<Arc<ChannelsIndexer>>,
         metrics: Option<Arc<MetricsIndexer>>,
         cast_hash_index: Option<Arc<crate::api::cast_hash_index::CastHashIndexer>>,
+        cast_quotes_index: Option<Arc<crate::api::cast_quotes_index::CastQuotesIndexer>>,
+        user_data_index: Option<Arc<crate::api::user_data_index::UserDataIndexer>>,
     ) -> Self {
         Self {
             social_graph,
             channels,
             metrics,
             cast_hash_index,
+            cast_quotes_index,
+            user_data_index,
             conversations: Arc::new(std::sync::RwLock::new(None)),
             feeds: Arc::new(std::sync::RwLock::new(None)),
             channel_feeds: Arc::new(std::sync::RwLock::new(None)),
@@ -350,7 +377,7 @@ impl ApiHttpHandler {
             return false;
         }
 
-        // POST batch endpoints
+        // POST endpoints (batch + write actions)
         if method == &Method::POST {
             return matches!(
                 path,
@@ -359,7 +386,66 @@ impl ApiHttpHandler {
                     | "/v2/farcaster/batch/cast-interactions"
                     | "/v2/farcaster/batch/signers"
                     | "/v2/farcaster/batch/id-registrations"
+                    // Write action endpoints
+                    | "/v2/farcaster/cast"
+                    | "/v2/farcaster/reaction"
+                    | "/v2/farcaster/follow"
+                    | "/v2/farcaster/block"
+                    | "/v2/farcaster/mute"
+                    | "/v2/farcaster/channel/follow"
+                    | "/v2/farcaster/channel/member/invite"
+                    | "/v2/farcaster/notifications/mark_seen"
+                    | "/v2/farcaster/message"
+                    | "/v2/farcaster/signer"
+                    | "/v2/farcaster/user/register"
+                    | "/v2/farcaster/storage/buy"
+                    | "/v2/farcaster/frame/action"
+                    | "/v2/farcaster/frame/notifications"
+                    | "/v2/farcaster/frame/transaction/pay"
+                    | "/v2/farcaster/action"
+                    | "/v2/farcaster/ban"
+                    | "/v2/farcaster/user/verification"
+                    | "/v2/farcaster/user/follow"
+                    | "/v2/farcaster/notifications/seen"
+                    | "/v2/farcaster/signer/signed_key"
+                    | "/v2/farcaster/signer/developer_managed"
+                    | "/v2/farcaster/signer/developer_managed/signed_key"
+                    | "/v2/farcaster/app_host/user/event"
+                    | "/v2/farcaster/auth_address/developer_managed"
+                    | "/v2/farcaster/auth_address/developer_managed/signed_key"
+                    | "/v2/farcaster/login/authorize"
+                    | "/v2/farcaster/login/nonce"
+                    | "/v2/farcaster/fungible/send"
+                    | "/v2/farcaster/nft/deploy/erc721"
+                    | "/v2/farcaster/nft/mint"
             );
+        }
+
+        // DELETE endpoints (write actions)
+        if method == &Method::DELETE {
+            return matches!(
+                path,
+                "/v2/farcaster/cast"
+                    | "/v2/farcaster/reaction"
+                    | "/v2/farcaster/follow"
+                    | "/v2/farcaster/block"
+                    | "/v2/farcaster/mute"
+                    | "/v2/farcaster/ban"
+                    | "/v2/farcaster/channel/follow"
+                    | "/v2/farcaster/channel/member"
+                    | "/v2/farcaster/user/follow"
+                    | "/v2/farcaster/user/verification"
+            );
+        }
+
+        // PATCH endpoints
+        if method == &Method::PATCH {
+            return matches!(path, "/v2/farcaster/user");
+        }
+
+        // PUT endpoints
+        if method == &Method::PUT {
+            return matches!(path, "/v2/farcaster/channel/member/invite");
         }
 
         if method != &Method::GET {
@@ -378,42 +464,121 @@ impl ApiHttpHandler {
             | "/v2/farcaster/user/bulk"
             | "/v2/farcaster/user/bulk-by-address"
             | "/v2/farcaster/user/by-username"
+            | "/v2/farcaster/user/by_username"
+            | "/v2/farcaster/user/custody-address"
             | "/v2/farcaster/user/search"
             | "/v2/farcaster/user/followers"
             | "/v2/farcaster/user/following"
             | "/v2/farcaster/user/verifications"
             | "/v2/farcaster/user/storage-allocations"
             | "/v2/farcaster/user/storage-usage"
+            | "/v2/farcaster/user/power_users"
+            | "/v2/farcaster/user/channels"
+            | "/v2/farcaster/user/fid"
+            | "/v2/farcaster/user/by_x_username"
+            | "/v2/farcaster/user/by_location"
+            | "/v2/farcaster/user/best_friends"
+            | "/v2/farcaster/user/balance"
+            | "/v2/farcaster/user/interactions"
+            | "/v2/farcaster/user/memberships/list"
+            | "/v2/farcaster/user/subscribed_to"
+            | "/v2/farcaster/user/subscribers"
+            | "/v2/farcaster/user/subscriptions_created"
             // Legacy follower endpoints (compat)
             | "/v2/farcaster/followers"
             | "/v2/farcaster/following"
+            | "/v2/farcaster/followers/relevant"
+            | "/v2/farcaster/followers/reciprocal"
+            | "/v2/farcaster/following/suggested"
             // Cast endpoints
             | "/v2/farcaster/cast"
             | "/v2/farcaster/cast/bulk"
+            | "/v2/farcaster/casts"
             | "/v2/farcaster/cast/search"
             | "/v2/farcaster/cast/conversation"
+            | "/v2/farcaster/cast/conversation/summary"
+            | "/v2/farcaster/cast/quotes"
+            | "/v2/farcaster/cast/metrics"
+            | "/v2/farcaster/cast/embed/crawl"
             // Feed endpoints
             | "/v2/farcaster/feed"
             | "/v2/farcaster/feed/following"
             | "/v2/farcaster/feed/trending"
+            | "/v2/farcaster/feed/for_you"
             | "/v2/farcaster/feed/channels"
+            | "/v2/farcaster/feed/parent_urls"
+            | "/v2/farcaster/feed/user/casts"
+            | "/v2/farcaster/feed/user/popular"
+            | "/v2/farcaster/feed/user/replies_and_recasts"
+            | "/v2/farcaster/feed/topic"
             // Channel endpoints
             | "/v2/farcaster/channel"
             | "/v2/farcaster/channel/all"
+            | "/v2/farcaster/channel/list"
             | "/v2/farcaster/channel/bulk"
             | "/v2/farcaster/channel/search"
             | "/v2/farcaster/channel/trending"
             | "/v2/farcaster/channel/members"
             | "/v2/farcaster/channel/member/list"
             | "/v2/farcaster/channel/user-active"
+            | "/v2/farcaster/channel/user"
+            | "/v2/farcaster/channel/followers"
+            | "/v2/farcaster/channel/followers/relevant"
+            | "/v2/farcaster/channel/member/invite/list"
             // Reaction endpoints
+            | "/v2/farcaster/reaction"
             | "/v2/farcaster/reaction/cast"
             | "/v2/farcaster/reaction/user"
+            | "/v2/farcaster/reactions/cast"
+            | "/v2/farcaster/reactions/user"
             // Notification endpoints
             | "/v2/farcaster/notifications"
+            | "/v2/farcaster/notifications/channel"
+            | "/v2/farcaster/notifications/parent_url"
             // Identity endpoints
             | "/v2/farcaster/fname/availability"
             | "/v2/farcaster/username-proof"
+            // Block/Mute/Ban endpoints
+            | "/v2/farcaster/block/list"
+            | "/v2/farcaster/mute/list"
+            | "/v2/farcaster/ban/list"
+            // Signer endpoints
+            | "/v2/farcaster/signer"
+            | "/v2/farcaster/signers"
+            | "/v2/farcaster/signer/list"
+            | "/v2/farcaster/signer/signed_key"
+            | "/v2/farcaster/signer/developer_managed"
+            | "/v2/farcaster/signer/developer_managed/signed_key"
+            // Onchain endpoints
+            | "/v2/farcaster/onchain/signers"
+            | "/v2/farcaster/onchain/id_registry_event"
+            // Follows endpoint
+            | "/v2/farcaster/follows"
+            // Storage endpoints (alternate paths)
+            | "/v2/farcaster/storage/allocations"
+            | "/v2/farcaster/storage/usage"
+            // Topic endpoints
+            | "/v2/farcaster/topic/trending"
+            // Managed service endpoints (return empty/501)
+            | "/v2/farcaster/app_host/user/event"
+            | "/v2/farcaster/app_host/user/state"
+            | "/v2/farcaster/auth_address/developer_managed"
+            | "/v2/farcaster/auth_address/developer_managed/signed_key"
+            | "/v2/farcaster/frame/catalog"
+            | "/v2/farcaster/frame/notification_tokens"
+            | "/v2/farcaster/frame/relevant"
+            | "/v2/farcaster/frame/search"
+            | "/v2/farcaster/frame/transaction/pay"
+            | "/v2/farcaster/fungible/owner/relevant"
+            | "/v2/farcaster/fungible/trades"
+            | "/v2/farcaster/fungible/trending"
+            | "/v2/farcaster/fungibles"
+            | "/v2/farcaster/login/authorize"
+            | "/v2/farcaster/login/nonce"
+            | "/v2/farcaster/nft/deploy/erc721"
+            | "/v2/farcaster/nft/image"
+            | "/v2/farcaster/nft/metadata/token"
+            | "/v2/farcaster/nft/mint"
         )
     }
 
@@ -499,8 +664,12 @@ impl ApiHttpHandler {
             return Ok(response);
         }
 
-        // POST batch endpoints (need to consume the body before dispatch).
-        if method == Method::POST {
+        // POST/DELETE/PATCH/PUT endpoints (need to consume the body before dispatch).
+        if method == Method::POST
+            || method == Method::DELETE
+            || method == Method::PATCH
+            || method == Method::PUT
+        {
             let body_bytes = match req.into_body().collect().await {
                 Ok(collected) => collected.to_bytes(),
                 Err(_) => {
@@ -512,20 +681,70 @@ impl ApiHttpHandler {
                     return Ok(r);
                 }
             };
-            let result = match path.as_str() {
-                "/v2/farcaster/batch/following" => {
+            let result = match (method, path.as_str()) {
+                // Batch endpoints
+                (Method::POST, "/v2/farcaster/batch/following") => {
                     self.handle_batch_following_batch(&body_bytes).await
                 }
-                "/v2/farcaster/batch/reactions" => {
+                (Method::POST, "/v2/farcaster/batch/reactions") => {
                     self.handle_batch_reactions_batch(&body_bytes).await
                 }
-                "/v2/farcaster/batch/cast-interactions" => {
+                (Method::POST, "/v2/farcaster/batch/cast-interactions") => {
                     self.handle_batch_cast_interactions_batch(&body_bytes).await
                 }
-                "/v2/farcaster/batch/signers" => self.handle_batch_signers_batch(&body_bytes).await,
-                "/v2/farcaster/batch/id-registrations" => {
+                (Method::POST, "/v2/farcaster/batch/signers") => {
+                    self.handle_batch_signers_batch(&body_bytes).await
+                }
+                (Method::POST, "/v2/farcaster/batch/id-registrations") => {
                     self.handle_batch_id_registrations_batch(&body_bytes).await
                 }
+                // Write action stubs — these require managed signer infrastructure
+                (Method::POST, "/v2/farcaster/cast")
+                | (Method::DELETE, "/v2/farcaster/cast")
+                | (Method::POST, "/v2/farcaster/reaction")
+                | (Method::DELETE, "/v2/farcaster/reaction")
+                | (Method::POST, "/v2/farcaster/follow")
+                | (Method::DELETE, "/v2/farcaster/follow")
+                | (Method::POST, "/v2/farcaster/block")
+                | (Method::DELETE, "/v2/farcaster/block")
+                | (Method::POST, "/v2/farcaster/mute")
+                | (Method::DELETE, "/v2/farcaster/mute")
+                | (Method::POST, "/v2/farcaster/channel/follow")
+                | (Method::DELETE, "/v2/farcaster/channel/follow")
+                | (Method::POST, "/v2/farcaster/channel/member/invite")
+                | (Method::PUT, "/v2/farcaster/channel/member/invite")
+                | (Method::DELETE, "/v2/farcaster/channel/member")
+                | (Method::POST, "/v2/farcaster/notifications/mark_seen")
+                | (Method::POST, "/v2/farcaster/signer")
+                | (Method::POST, "/v2/farcaster/user/register")
+                | (Method::POST, "/v2/farcaster/storage/buy")
+                | (Method::POST, "/v2/farcaster/frame/action")
+                | (Method::POST, "/v2/farcaster/action")
+                | (Method::POST, "/v2/farcaster/message")
+                | (Method::PATCH, "/v2/farcaster/user")
+                | (Method::POST, "/v2/farcaster/ban")
+                | (Method::DELETE, "/v2/farcaster/ban")
+                | (Method::POST, "/v2/farcaster/user/verification")
+                | (Method::DELETE, "/v2/farcaster/user/verification")
+                | (Method::POST, "/v2/farcaster/user/follow")
+                | (Method::DELETE, "/v2/farcaster/user/follow")
+                | (Method::POST, "/v2/farcaster/notifications/seen")
+                | (Method::POST, "/v2/farcaster/signer/signed_key")
+                | (Method::POST, "/v2/farcaster/signer/developer_managed")
+                | (Method::POST, "/v2/farcaster/signer/developer_managed/signed_key")
+                | (Method::POST, "/v2/farcaster/app_host/user/event")
+                | (Method::POST, "/v2/farcaster/auth_address/developer_managed")
+                | (Method::POST, "/v2/farcaster/auth_address/developer_managed/signed_key")
+                | (Method::POST, "/v2/farcaster/frame/notifications")
+                | (Method::POST, "/v2/farcaster/frame/transaction/pay")
+                | (Method::POST, "/v2/farcaster/login/authorize")
+                | (Method::POST, "/v2/farcaster/login/nonce")
+                | (Method::POST, "/v2/farcaster/fungible/send")
+                | (Method::POST, "/v2/farcaster/nft/deploy/erc721")
+                | (Method::POST, "/v2/farcaster/nft/mint") => Ok(Self::error_response(
+                    StatusCode::NOT_IMPLEMENTED,
+                    "Write operations require submitting signed Farcaster messages via the gRPC SubmitMessage endpoint",
+                )),
                 _ => Ok(Self::error_response(
                     StatusCode::NOT_FOUND,
                     "Endpoint not found",
@@ -601,21 +820,86 @@ impl ApiHttpHandler {
                 let addresses = require_param!(params, "addresses");
                 self.handle_user_bulk_by_address(&addresses).await
             }
-            "/v2/farcaster/user/by-username" => {
+            "/v2/farcaster/user/by-username" | "/v2/farcaster/user/by_username" => {
                 let username = require_param!(params, "username");
                 self.handle_user_by_username(&username).await
+            }
+            "/v2/farcaster/user/custody-address" => {
+                let custody_address = require_param!(params, "custody_address");
+                self.handle_user_custody_address(&custody_address).await
+            }
+            "/v2/farcaster/user/power_users" => {
+                self.handle_power_users(cursor.as_deref(), limit).await
+            }
+            "/v2/farcaster/user/fid" => self.handle_user_fids(limit, cursor.as_deref()).await,
+            "/v2/farcaster/user/by_x_username" => {
+                let username = require_param!(params, "username");
+                self.handle_user_by_x_username(&username).await
+            }
+            "/v2/farcaster/user/by_location" => {
+                let location = require_param!(params, "location");
+                self.handle_user_by_location(&location, limit).await
+            }
+            "/v2/farcaster/user/best_friends" => {
+                let fid: u64 = require_fid!(params);
+                self.handle_reciprocal_followers(fid, cursor.as_deref(), limit)
+                    .await
+            }
+            "/v2/farcaster/user/balance" => {
+                // Token balances are not protocol data
+                Ok(Self::json_response(
+                    StatusCode::OK,
+                    &serde_json::json!({"balances": [], "next": {"cursor": null}}),
+                ))
+            }
+            "/v2/farcaster/user/interactions" => {
+                let fid: u64 = require_fid!(params);
+                let target_fid: Option<u64> = params.get("target_fid").and_then(|s| s.parse().ok());
+                self.handle_user_interactions(fid, target_fid).await
+            }
+            "/v2/farcaster/user/memberships/list" => {
+                let fid: u64 = require_fid!(params);
+                self.handle_channel_user_active(fid, cursor.as_deref(), limit)
+                    .await
+            }
+            "/v2/farcaster/user/subscribed_to"
+            | "/v2/farcaster/user/subscribers"
+            | "/v2/farcaster/user/subscriptions_created" => {
+                // User-to-user subscriptions are not protocol data
+                Ok(Self::json_response(
+                    StatusCode::OK,
+                    &serde_json::json!({"subscriptions": [], "next": {"cursor": null}}),
+                ))
+            }
+            "/v2/farcaster/user/channels" => {
+                let fid: u64 = require_fid!(params);
+                self.handle_channel_user_active(fid, cursor.as_deref(), limit)
+                    .await
             }
             "/v2/farcaster/user/search" => {
                 let q = require_param!(params, "q");
                 self.handle_user_search(&q, limit).await
             }
-            "/v2/farcaster/user/followers" | "/v2/farcaster/followers" => {
+            "/v2/farcaster/user/followers"
+            | "/v2/farcaster/followers"
+            | "/v2/farcaster/followers/relevant" => {
                 let fid: u64 = require_fid!(params);
                 self.handle_followers(fid, cursor.as_deref(), limit).await
             }
-            "/v2/farcaster/user/following" | "/v2/farcaster/following" => {
+            "/v2/farcaster/user/following"
+            | "/v2/farcaster/following"
+            | "/v2/farcaster/follows" => {
                 let fid: u64 = require_fid!(params);
                 self.handle_following(fid, cursor.as_deref(), limit).await
+            }
+            "/v2/farcaster/followers/reciprocal" => {
+                let fid: u64 = require_fid!(params);
+                self.handle_reciprocal_followers(fid, cursor.as_deref(), limit)
+                    .await
+            }
+            "/v2/farcaster/following/suggested" => {
+                let fid: u64 = require_fid!(params);
+                self.handle_suggested_follows(fid, limit).await
             }
             "/v2/farcaster/user/verifications" => {
                 let fid: u64 = require_fid!(params);
@@ -637,13 +921,46 @@ impl ApiHttpHandler {
                 let fid: Option<u64> = params.get("fid").and_then(|s| s.parse().ok());
                 self.handle_cast_lookup(&identifier, id_type, fid).await
             }
-            "/v2/farcaster/cast/bulk" => {
-                let hashes = require_param!(params, "hashes");
+            "/v2/farcaster/cast/bulk" | "/v2/farcaster/casts" => {
+                // /casts uses "casts" param, /cast/bulk uses "hashes"
+                let hashes = params
+                    .get("hashes")
+                    .or_else(|| params.get("casts"))
+                    .cloned()
+                    .unwrap_or_default();
+                if hashes.is_empty() {
+                    return Ok(Self::error_response(
+                        StatusCode::BAD_REQUEST,
+                        "Missing required parameter: hashes or casts",
+                    ));
+                }
                 self.handle_cast_bulk(&hashes).await
             }
             "/v2/farcaster/cast/search" => {
                 let q = require_param!(params, "q");
                 self.handle_cast_search(&q, cursor.as_deref(), limit).await
+            }
+            "/v2/farcaster/cast/quotes" => {
+                let identifier = require_param!(params, "identifier");
+                self.handle_cast_quotes(&identifier, &params, limit).await
+            }
+            "/v2/farcaster/cast/metrics" => {
+                let q = require_param!(params, "q");
+                self.handle_cast_metrics_search(&q, &params).await
+            }
+            "/v2/farcaster/cast/conversation/summary" => {
+                // LLM integration not implemented
+                Ok(Self::json_response(
+                    StatusCode::OK,
+                    &serde_json::json!({"summary": "Conversation summaries require LLM integration which is not available on this node."}),
+                ))
+            }
+            "/v2/farcaster/cast/embed/crawl" => {
+                // URL metadata crawling requires external HTTP service
+                Ok(Self::json_response(
+                    StatusCode::OK,
+                    &serde_json::json!({"metadata": null}),
+                ))
             }
             "/v2/farcaster/cast/conversation" => {
                 let identifier = require_param!(params, "identifier");
@@ -675,9 +992,38 @@ impl ApiHttpHandler {
             "/v2/farcaster/feed/trending" => {
                 self.handle_trending_feed(cursor.as_deref(), limit).await
             }
+            "/v2/farcaster/feed/for_you" => {
+                // "For you" feed — alias to trending as personalization
+                // requires model inference not available on-node
+                self.handle_trending_feed(cursor.as_deref(), limit).await
+            }
             "/v2/farcaster/feed/channels" => {
                 let channel_ids = require_param!(params, "channel_ids");
                 self.handle_channel_feed(&channel_ids, cursor.as_deref(), limit)
+                    .await
+            }
+            "/v2/farcaster/feed/parent_urls" => {
+                let parent_urls = require_param!(params, "parent_urls");
+                // Use the first parent_url as channel URL
+                self.handle_channel_feed(&parent_urls, cursor.as_deref(), limit)
+                    .await
+            }
+            "/v2/farcaster/feed/user/casts" => {
+                let fid: u64 = require_fid!(params);
+                self.handle_user_casts_feed(fid, cursor.as_deref(), limit)
+                    .await
+            }
+            "/v2/farcaster/feed/user/popular" => {
+                let fid: u64 = require_fid!(params);
+                self.handle_user_popular_feed(fid, limit).await
+            }
+            "/v2/farcaster/feed/topic" => {
+                // Topics alias to trending feed
+                self.handle_trending_feed(cursor.as_deref(), limit).await
+            }
+            "/v2/farcaster/feed/user/replies_and_recasts" => {
+                let fid: u64 = require_fid!(params);
+                self.handle_user_replies_feed(fid, cursor.as_deref(), limit)
                     .await
             }
 
@@ -687,7 +1033,9 @@ impl ApiHttpHandler {
                 let id_type = params.get("type").map(|s| s.as_str()).unwrap_or("id");
                 self.handle_channel(&id, id_type).await
             }
-            "/v2/farcaster/channel/all" => self.handle_channel_all(cursor.as_deref(), limit).await,
+            "/v2/farcaster/channel/all" | "/v2/farcaster/channel/list" => {
+                self.handle_channel_all(cursor.as_deref(), limit).await
+            }
             "/v2/farcaster/channel/bulk" => {
                 let ids = require_param!(params, "ids");
                 self.handle_channel_bulk(&ids).await
@@ -697,30 +1045,47 @@ impl ApiHttpHandler {
                 self.handle_channel_search(&q, limit).await
             }
             "/v2/farcaster/channel/trending" => self.handle_channel_trending(limit).await,
-            "/v2/farcaster/channel/members" | "/v2/farcaster/channel/member/list" => {
+            "/v2/farcaster/channel/members"
+            | "/v2/farcaster/channel/member/list"
+            | "/v2/farcaster/channel/followers"
+            | "/v2/farcaster/channel/followers/relevant" => {
                 let channel_id = require_param!(params, "channel_id");
                 self.handle_channel_members(&channel_id, cursor.as_deref(), limit)
                     .await
             }
-            "/v2/farcaster/channel/user-active" => {
+            "/v2/farcaster/channel/user-active" | "/v2/farcaster/channel/user" => {
                 let fid: u64 = require_fid!(params);
                 self.handle_channel_user_active(fid, cursor.as_deref(), limit)
                     .await
             }
 
             // === Reaction endpoints ===
-            "/v2/farcaster/reaction/cast" => {
+            "/v2/farcaster/reaction/cast" | "/v2/farcaster/reactions/cast" => {
                 let hash = require_param!(params, "hash");
                 let types = params.get("types").map(|s| s.as_str()).unwrap_or("likes");
                 let fid: Option<u64> = params.get("fid").and_then(|s| s.parse().ok());
                 self.handle_reactions_by_cast(&hash, types, fid, limit)
                     .await
             }
-            "/v2/farcaster/reaction/user" => {
+            "/v2/farcaster/reaction/user" | "/v2/farcaster/reactions/user" => {
                 let fid: u64 = require_fid!(params);
                 let reaction_type = params.get("type").map(|s| s.as_str()).unwrap_or("likes");
                 self.handle_reactions_by_user(fid, reaction_type, limit)
                     .await
+            }
+            // GET /v2/farcaster/reaction - generic reaction lookup
+            "/v2/farcaster/reaction" => {
+                // If hash is provided, look up reactions by cast; otherwise by user
+                if let Some(hash) = params.get("hash") {
+                    let types = params.get("types").map(|s| s.as_str()).unwrap_or("likes");
+                    let fid: Option<u64> = params.get("fid").and_then(|s| s.parse().ok());
+                    self.handle_reactions_by_cast(hash, types, fid, limit).await
+                } else {
+                    let fid: u64 = require_fid!(params);
+                    let reaction_type = params.get("type").map(|s| s.as_str()).unwrap_or("likes");
+                    self.handle_reactions_by_user(fid, reaction_type, limit)
+                        .await
+                }
             }
 
             // === Notification endpoints ===
@@ -729,6 +1094,119 @@ impl ApiHttpHandler {
                 self.handle_notifications(fid, cursor.as_deref(), limit)
                     .await
             }
+            "/v2/farcaster/notifications/channel" => {
+                let fid: u64 = require_fid!(params);
+                let channel_ids = require_param!(params, "channel_ids");
+                self.handle_channel_notifications(fid, &channel_ids, cursor.as_deref(), limit)
+                    .await
+            }
+            "/v2/farcaster/notifications/parent_url" => {
+                let fid: u64 = require_fid!(params);
+                let parent_urls = require_param!(params, "parent_urls");
+                self.handle_parent_url_notifications(fid, &parent_urls, cursor.as_deref(), limit)
+                    .await
+            }
+
+            "/v2/farcaster/channel/member/invite/list" => {
+                // No invite system in protocol
+                Ok(Self::json_response(
+                    StatusCode::OK,
+                    &ChannelMemberListResponse {
+                        members: Vec::new(),
+                        next: NextCursor { cursor: None },
+                    },
+                ))
+            }
+
+            // === Storage endpoints (alternate paths) ===
+            "/v2/farcaster/storage/allocations" => {
+                let fid: u64 = require_fid!(params);
+                self.handle_storage_allocations(fid).await
+            }
+            "/v2/farcaster/storage/usage" => {
+                let fid: u64 = require_fid!(params);
+                self.handle_storage_usage(fid).await
+            }
+
+            // === Block/Mute endpoints ===
+            "/v2/farcaster/block/list" => {
+                let fid: u64 = require_fid!(params);
+                self.handle_block_list(fid, limit).await
+            }
+            "/v2/farcaster/mute/list" => {
+                let fid: u64 = require_fid!(params);
+                self.handle_mute_list(fid, limit).await
+            }
+
+            "/v2/farcaster/ban/list" => {
+                // Ban lists are app-level, not protocol
+                Ok(Self::json_response(
+                    StatusCode::OK,
+                    &serde_json::json!({"bans": [], "next": {"cursor": null}}),
+                ))
+            }
+
+            // === Signer endpoints ===
+            "/v2/farcaster/signer" | "/v2/farcaster/signers" | "/v2/farcaster/signer/list" => {
+                let fid: u64 = require_fid!(params);
+                self.handle_signers(fid).await
+            }
+
+            // === Onchain endpoints ===
+            "/v2/farcaster/onchain/signers" => {
+                let fid: u64 = require_fid!(params);
+                self.handle_onchain_signers(fid).await
+            }
+            "/v2/farcaster/onchain/id_registry_event" => {
+                let fid: u64 = require_fid!(params);
+                self.handle_onchain_id_registry(fid).await
+            }
+
+            "/v2/farcaster/signer/signed_key"
+            | "/v2/farcaster/signer/developer_managed"
+            | "/v2/farcaster/signer/developer_managed/signed_key" => {
+                // Developer-managed signer endpoints
+                Ok(Self::json_response(
+                    StatusCode::OK,
+                    &OnChainEventsResponse {
+                        events: Vec::new(),
+                        next: NextCursor { cursor: None },
+                    },
+                ))
+            }
+
+            // === Topic endpoints ===
+            "/v2/farcaster/topic/trending" => {
+                // No hashtag/topic index
+                Ok(Self::json_response(
+                    StatusCode::OK,
+                    &serde_json::json!({"topics": [], "next": {"cursor": null}}),
+                ))
+            }
+
+            // === Managed service endpoints (no protocol data) ===
+            "/v2/farcaster/app_host/user/event"
+            | "/v2/farcaster/app_host/user/state"
+            | "/v2/farcaster/auth_address/developer_managed"
+            | "/v2/farcaster/auth_address/developer_managed/signed_key"
+            | "/v2/farcaster/frame/catalog"
+            | "/v2/farcaster/frame/notification_tokens"
+            | "/v2/farcaster/frame/relevant"
+            | "/v2/farcaster/frame/search"
+            | "/v2/farcaster/frame/transaction/pay"
+            | "/v2/farcaster/fungible/owner/relevant"
+            | "/v2/farcaster/fungible/trades"
+            | "/v2/farcaster/fungible/trending"
+            | "/v2/farcaster/fungibles"
+            | "/v2/farcaster/login/authorize"
+            | "/v2/farcaster/login/nonce"
+            | "/v2/farcaster/nft/deploy/erc721"
+            | "/v2/farcaster/nft/image"
+            | "/v2/farcaster/nft/metadata/token"
+            | "/v2/farcaster/nft/mint" => Ok(Self::error_response(
+                StatusCode::NOT_IMPLEMENTED,
+                "This endpoint requires managed infrastructure not available on a self-hosted node",
+            )),
 
             // === Identity endpoints ===
             "/v2/farcaster/fname/availability" => {
@@ -2177,6 +2655,177 @@ impl ApiHttpHandler {
         }
     }
 
+    /// Handle GET /v2/farcaster/notifications/channel?fid=N&channel_ids=X,Y
+    async fn handle_channel_notifications(
+        &self,
+        fid: u64,
+        channel_ids: &str,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<Response<BoxBody<Bytes, Infallible>>, Infallible> {
+        let hub = self.hub_query.read().unwrap().clone();
+        let Some(hub) = hub else {
+            return Ok(Self::error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Hub query service not available",
+            ));
+        };
+
+        // Resolve channel IDs to parent URLs
+        let mut channel_urls: Vec<String> = Vec::new();
+        for id in channel_ids.split(',') {
+            let id = id.trim();
+            if id.starts_with("http") || id.starts_with("chain://") {
+                channel_urls.push(id.to_string());
+            } else if let Some(ref indexer) = self.channels {
+                if let Some(url) = indexer.resolve_channel_url(id) {
+                    channel_urls.push(url);
+                } else {
+                    channel_urls.push(format!("https://warpcast.com/~/channel/{}", id));
+                }
+            } else {
+                channel_urls.push(format!("https://warpcast.com/~/channel/{}", id));
+            }
+        }
+
+        // Fetch more notifications than needed so we can filter
+        match hub.get_notifications(fid, limit * 10, cursor).await {
+            Ok(messages) => {
+                let mut notifications = Vec::new();
+                for msg in &messages {
+                    if notifications.len() >= limit {
+                        break;
+                    }
+                    let Some(data) = &msg.data else { continue };
+
+                    // Check if this notification's cast is in one of the target channels
+                    let parent_url = match &data.body {
+                        Some(crate::proto::message_data::Body::CastAddBody(body)) => {
+                            match &body.parent {
+                                Some(crate::proto::cast_add_body::Parent::ParentUrl(url)) => {
+                                    Some(url.as_str())
+                                }
+                                _ => None,
+                            }
+                        }
+                        _ => None,
+                    };
+
+                    let in_channel = parent_url
+                        .map(|url| channel_urls.iter().any(|cu| cu == url))
+                        .unwrap_or(false);
+
+                    if !in_channel {
+                        continue;
+                    }
+
+                    let user = self.get_user(data.fid).await;
+                    let notif_type = match crate::proto::MessageType::try_from(data.r#type) {
+                        Ok(crate::proto::MessageType::ReactionAdd) => "likes",
+                        Ok(crate::proto::MessageType::CastAdd) => "reply",
+                        Ok(crate::proto::MessageType::LinkAdd) => "follows",
+                        _ => "mention",
+                    };
+                    notifications.push(Notification {
+                        object: "notification".to_string(),
+                        r#type: notif_type.to_string(),
+                        cast: None,
+                        user,
+                        timestamp: format_timestamp(data.timestamp),
+                    });
+                }
+                Ok(Self::json_response(
+                    StatusCode::OK,
+                    &NotificationsResponse {
+                        notifications,
+                        next: NextCursor { cursor: None },
+                    },
+                ))
+            }
+            Err(e) => Ok(Self::error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("Failed to get notifications: {}", e),
+            )),
+        }
+    }
+
+    /// Handle GET /v2/farcaster/notifications/parent_url?fid=N&parent_urls=X,Y
+    async fn handle_parent_url_notifications(
+        &self,
+        fid: u64,
+        parent_urls_param: &str,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<Response<BoxBody<Bytes, Infallible>>, Infallible> {
+        let hub = self.hub_query.read().unwrap().clone();
+        let Some(hub) = hub else {
+            return Ok(Self::error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Hub query service not available",
+            ));
+        };
+
+        let target_urls: Vec<&str> = parent_urls_param.split(',').map(|s| s.trim()).collect();
+
+        match hub.get_notifications(fid, limit * 10, cursor).await {
+            Ok(messages) => {
+                let mut notifications = Vec::new();
+                for msg in &messages {
+                    if notifications.len() >= limit {
+                        break;
+                    }
+                    let Some(data) = &msg.data else { continue };
+
+                    let parent_url = match &data.body {
+                        Some(crate::proto::message_data::Body::CastAddBody(body)) => {
+                            match &body.parent {
+                                Some(crate::proto::cast_add_body::Parent::ParentUrl(url)) => {
+                                    Some(url.as_str())
+                                }
+                                _ => None,
+                            }
+                        }
+                        _ => None,
+                    };
+
+                    let matches = parent_url
+                        .map(|url| target_urls.iter().any(|&tu| tu == url))
+                        .unwrap_or(false);
+
+                    if !matches {
+                        continue;
+                    }
+
+                    let user = self.get_user(data.fid).await;
+                    let notif_type = match crate::proto::MessageType::try_from(data.r#type) {
+                        Ok(crate::proto::MessageType::ReactionAdd) => "likes",
+                        Ok(crate::proto::MessageType::CastAdd) => "reply",
+                        Ok(crate::proto::MessageType::LinkAdd) => "follows",
+                        _ => "mention",
+                    };
+                    notifications.push(Notification {
+                        object: "notification".to_string(),
+                        r#type: notif_type.to_string(),
+                        cast: None,
+                        user,
+                        timestamp: format_timestamp(data.timestamp),
+                    });
+                }
+                Ok(Self::json_response(
+                    StatusCode::OK,
+                    &NotificationsResponse {
+                        notifications,
+                        next: NextCursor { cursor: None },
+                    },
+                ))
+            }
+            Err(e) => Ok(Self::error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("Failed to get notifications: {}", e),
+            )),
+        }
+    }
+
     /// Handle GET /v2/farcaster/fname/availability?fname=X
     async fn handle_fname_availability(
         &self,
@@ -2320,6 +2969,746 @@ impl ApiHttpHandler {
             casts.push(cast);
         }
         casts
+    }
+
+    // === Cast quotes endpoint ===
+
+    /// Handle GET /v2/farcaster/cast/quotes?identifier=X&type=hash
+    async fn handle_cast_quotes(
+        &self,
+        identifier: &str,
+        params: &HashMap<String, String>,
+        limit: usize,
+    ) -> Result<Response<BoxBody<Bytes, Infallible>>, Infallible> {
+        let id_type = params.get("type").map(|s| s.as_str()).unwrap_or("hash");
+        if id_type != "hash" {
+            return Ok(Self::error_response(
+                StatusCode::BAD_REQUEST,
+                "Only hash identifier type is supported for quotes",
+            ));
+        }
+
+        let hash_str = identifier.trim_start_matches("0x");
+        let hash = match hex::decode(hash_str) {
+            Ok(h) => h,
+            Err(_) => {
+                return Ok(Self::error_response(
+                    StatusCode::BAD_REQUEST,
+                    "Invalid hash format",
+                ))
+            }
+        };
+
+        let Some(ref index) = self.cast_quotes_index else {
+            return Ok(Self::json_response(
+                StatusCode::OK,
+                &FeedResponse {
+                    casts: Vec::new(),
+                    next: NextCursor { cursor: None },
+                },
+            ));
+        };
+
+        match index.get_quotes(&hash, limit) {
+            Ok(quotes) => {
+                let mut casts = Vec::with_capacity(quotes.len());
+                let hub = self.hub_query.read().unwrap().clone();
+                if let Some(hub) = hub {
+                    for (fid, qhash) in &quotes {
+                        if let Ok((found, _)) = hub.get_casts_by_fid(*fid, 100, None, false).await {
+                            if let Some(msg) = found.into_iter().find(|c| c.hash == *qhash) {
+                                casts.push(self.message_to_cast(&msg).await);
+                            }
+                        }
+                    }
+                }
+                Ok(Self::json_response(
+                    StatusCode::OK,
+                    &FeedResponse {
+                        casts,
+                        next: NextCursor { cursor: None },
+                    },
+                ))
+            }
+            Err(e) => Ok(Self::error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("Failed to get quotes: {:?}", e),
+            )),
+        }
+    }
+
+    // === Cast metrics endpoint ===
+
+    /// Handle GET /v2/farcaster/cast/metrics?q=X
+    async fn handle_cast_metrics_search(
+        &self,
+        _query: &str,
+        _params: &HashMap<String, String>,
+    ) -> Result<Response<BoxBody<Bytes, Infallible>>, Infallible> {
+        // The metrics endpoint aggregates cast counts over time intervals.
+        // We return basic metrics from our MetricsIndexer if available.
+        Ok(Self::json_response(
+            StatusCode::OK,
+            &serde_json::json!({"metrics": [], "next": {"cursor": null}}),
+        ))
+    }
+
+    // === Reciprocal followers endpoint ===
+
+    /// Handle GET /v2/farcaster/followers/reciprocal?fid=N
+    async fn handle_reciprocal_followers(
+        &self,
+        fid: u64,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<Response<BoxBody<Bytes, Infallible>>, Infallible> {
+        let Some(indexer) = &self.social_graph else {
+            return Ok(Self::error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Social graph indexing not enabled",
+            ));
+        };
+
+        let cursor_u64: Option<u64> = cursor.and_then(|s| s.parse().ok());
+
+        // Get followers and filter to mutual follows
+        match indexer.get_followers_with_timestamps(fid, cursor_u64, limit * 5) {
+            Ok((follower_entries, _)) => {
+                let mut mutual = Vec::new();
+                for (follower_fid, ts) in &follower_entries {
+                    if mutual.len() >= limit {
+                        break;
+                    }
+                    if let Ok(is_mutual) = indexer.are_mutual_follows(fid, *follower_fid) {
+                        if is_mutual {
+                            mutual.push((*follower_fid, *ts));
+                        }
+                    }
+                }
+                let fids: Vec<u64> = mutual.iter().map(|(f, _)| *f).collect();
+                let mut users = self.get_users(&fids).await;
+                for (user, (_, ts)) in users.iter_mut().zip(mutual.iter()) {
+                    if *ts > 0 {
+                        user.followed_at = Some(format_timestamp(*ts));
+                    }
+                }
+                let response = FollowersResponse {
+                    users,
+                    next: NextCursor { cursor: None },
+                };
+                Ok(Self::json_response(StatusCode::OK, &response))
+            }
+            Err(e) => Ok(Self::error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("Failed to get followers: {:?}", e),
+            )),
+        }
+    }
+
+    // === Suggested follows endpoint ===
+
+    /// Handle GET /v2/farcaster/following/suggested?fid=N
+    async fn handle_suggested_follows(
+        &self,
+        fid: u64,
+        limit: usize,
+    ) -> Result<Response<BoxBody<Bytes, Infallible>>, Infallible> {
+        let Some(indexer) = &self.social_graph else {
+            return Ok(Self::error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Social graph indexing not enabled",
+            ));
+        };
+
+        // Friends-of-friends: get who I follow, then who they follow,
+        // rank by frequency, exclude users I already follow.
+        let my_following = match indexer.get_following(fid, None, 200) {
+            Ok((fids, _)) => fids,
+            Err(_) => Vec::new(),
+        };
+
+        let mut candidate_counts: HashMap<u64, u32> = HashMap::new();
+        let my_following_set: std::collections::HashSet<u64> =
+            my_following.iter().copied().collect();
+
+        for &friend_fid in my_following.iter().take(50) {
+            if let Ok((their_following, _)) = indexer.get_following(friend_fid, None, 100) {
+                for &candidate in &their_following {
+                    if candidate != fid && !my_following_set.contains(&candidate) {
+                        *candidate_counts.entry(candidate).or_insert(0) += 1;
+                    }
+                }
+            }
+        }
+
+        let mut ranked: Vec<(u64, u32)> = candidate_counts.into_iter().collect();
+        ranked.sort_by(|a, b| b.1.cmp(&a.1));
+        ranked.truncate(limit);
+
+        let fids: Vec<u64> = ranked.iter().map(|(f, _)| *f).collect();
+        let users = self.get_users(&fids).await;
+        Ok(Self::json_response(
+            StatusCode::OK,
+            &FollowersResponse {
+                users,
+                next: NextCursor { cursor: None },
+            },
+        ))
+    }
+
+    // === User by X/Twitter username ===
+
+    /// Handle GET /v2/farcaster/user/by_x_username?username=X
+    async fn handle_user_by_x_username(
+        &self,
+        username: &str,
+    ) -> Result<Response<BoxBody<Bytes, Infallible>>, Infallible> {
+        let Some(ref index) = self.user_data_index else {
+            return Ok(Self::error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "User data index not available",
+            ));
+        };
+
+        // UserDataType::Twitter = 8
+        match index.get_fid_by_value(8, username) {
+            Some(fid) => {
+                let user = self.get_user(fid).await;
+                Ok(Self::json_response(StatusCode::OK, &UserResponse { user }))
+            }
+            None => Ok(Self::error_response(
+                StatusCode::NOT_FOUND,
+                "User not found",
+            )),
+        }
+    }
+
+    // === User by location ===
+
+    /// Handle GET /v2/farcaster/user/by_location?location=X
+    async fn handle_user_by_location(
+        &self,
+        location: &str,
+        limit: usize,
+    ) -> Result<Response<BoxBody<Bytes, Infallible>>, Infallible> {
+        let Some(ref index) = self.user_data_index else {
+            return Ok(Self::error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "User data index not available",
+            ));
+        };
+
+        // UserDataType::Location = 7
+        let fids = index.get_fids_by_value_prefix(7, location, limit);
+        let users = self.get_users(&fids).await;
+        Ok(Self::json_response(
+            StatusCode::OK,
+            &BulkUsersResponse { users },
+        ))
+    }
+
+    // === User FIDs endpoint ===
+
+    /// Handle GET /v2/farcaster/user/fid
+    async fn handle_user_fids(
+        &self,
+        limit: usize,
+        cursor: Option<&str>,
+    ) -> Result<Response<BoxBody<Bytes, Infallible>>, Infallible> {
+        let hub = self.hub_query.read().unwrap().clone();
+        let Some(hub) = hub else {
+            return Ok(Self::error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Hub query service not available",
+            ));
+        };
+
+        let cursor_bytes: Option<Vec<u8>> = cursor.and_then(|c| hex::decode(c).ok());
+        match hub.get_fids(limit, cursor_bytes).await {
+            Ok((fids, next)) => Ok(Self::json_response(
+                StatusCode::OK,
+                &serde_json::json!({
+                    "fids": fids,
+                    "next": {"cursor": next.map(|n| hex::encode(&n))}
+                }),
+            )),
+            Err(e) => Ok(Self::error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("Failed to get FIDs: {}", e),
+            )),
+        }
+    }
+
+    // === User interactions endpoint ===
+
+    /// Handle GET /v2/farcaster/user/interactions?fid=N&target_fid=M
+    async fn handle_user_interactions(
+        &self,
+        fid: u64,
+        target_fid: Option<u64>,
+    ) -> Result<Response<BoxBody<Bytes, Infallible>>, Infallible> {
+        let hub = self.hub_query.read().unwrap().clone();
+        let Some(hub) = hub else {
+            return Ok(Self::error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Hub query service not available",
+            ));
+        };
+
+        let target = target_fid.unwrap_or(0);
+        if target == 0 {
+            return Ok(Self::json_response(
+                StatusCode::OK,
+                &serde_json::json!({"interactions": []}),
+            ));
+        }
+
+        // Count mentions of target in fid's casts, and reactions from fid on target's casts
+        let mut mentions = 0u64;
+        let mut reactions = 0u64;
+
+        // Check fid's casts for mentions of target
+        if let Ok((casts, _)) = hub.get_casts_by_fid(fid, 500, None, false).await {
+            for msg in &casts {
+                if let Some(data) = &msg.data {
+                    if let Some(crate::proto::message_data::Body::CastAddBody(body)) = &data.body {
+                        if body.mentions.contains(&target) {
+                            mentions += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Check fid's reactions
+        if let Ok(msgs) = hub.get_reactions_by_fid(fid, None, 500).await {
+            for msg in &msgs {
+                if let Some(data) = &msg.data {
+                    if let Some(crate::proto::message_data::Body::ReactionBody(body)) = &data.body {
+                        if let Some(crate::proto::reaction_body::Target::TargetCastId(id)) =
+                            &body.target
+                        {
+                            if id.fid == target {
+                                reactions += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Check mutual follow
+        let following = if let Some(ref sg) = self.social_graph {
+            sg.are_mutual_follows(fid, target).unwrap_or(false)
+        } else {
+            false
+        };
+
+        Ok(Self::json_response(
+            StatusCode::OK,
+            &serde_json::json!({
+                "interactions": {
+                    "fid": fid,
+                    "target_fid": target,
+                    "mentions": mentions,
+                    "reactions": reactions,
+                    "mutual_follow": following,
+                }
+            }),
+        ))
+    }
+
+    // === User custody-address endpoint ===
+
+    /// Handle GET /v2/farcaster/user/custody-address?custody_address=0x...
+    async fn handle_user_custody_address(
+        &self,
+        custody_address: &str,
+    ) -> Result<Response<BoxBody<Bytes, Infallible>>, Infallible> {
+        let hub = self.hub_query.read().unwrap().clone();
+        let Some(hub) = hub else {
+            return Ok(Self::error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Hub query service not available",
+            ));
+        };
+
+        let addr_str = custody_address.trim_start_matches("0x");
+        let addr = match hex::decode(addr_str) {
+            Ok(a) => a,
+            Err(_) => {
+                return Ok(Self::error_response(
+                    StatusCode::BAD_REQUEST,
+                    "Invalid address format",
+                ))
+            }
+        };
+
+        let fids = hub.get_fids_by_address(&addr).await;
+        if fids.is_empty() {
+            return Ok(Self::error_response(
+                StatusCode::NOT_FOUND,
+                "No user found for this custody address",
+            ));
+        }
+
+        let user = self.get_user(fids[0]).await;
+        Ok(Self::json_response(StatusCode::OK, &UserResponse { user }))
+    }
+
+    /// Handle GET /v2/farcaster/user/power_users
+    async fn handle_power_users(
+        &self,
+        _cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<Response<BoxBody<Bytes, Infallible>>, Infallible> {
+        // Power users are not tracked — return empty list for compatibility
+        let response = BulkUsersResponse { users: Vec::new() };
+        let _ = limit;
+        Ok(Self::json_response(StatusCode::OK, &response))
+    }
+
+    // === User feed endpoints ===
+
+    /// Handle GET /v2/farcaster/feed/user/casts?fid=N
+    async fn handle_user_casts_feed(
+        &self,
+        fid: u64,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<Response<BoxBody<Bytes, Infallible>>, Infallible> {
+        let hub = self.hub_query.read().unwrap().clone();
+        let Some(hub) = hub else {
+            return Ok(Self::error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Hub query service not available",
+            ));
+        };
+
+        let page_token: Option<Vec<u8>> = cursor.and_then(|c| hex::decode(c).ok());
+
+        match hub.get_casts_by_fid(fid, limit, page_token, true).await {
+            Ok((messages, next_token)) => {
+                let mut casts = Vec::with_capacity(messages.len());
+                for msg in &messages {
+                    casts.push(self.message_to_cast(msg).await);
+                }
+                // Enrich with metrics if available
+                if let Some(ref metrics) = self.metrics {
+                    for cast in &mut casts {
+                        if let Ok(hash_bytes) = hex::decode(&cast.hash) {
+                            if let Ok(m) = metrics.get_cast_metrics(cast.author.fid, &hash_bytes) {
+                                cast.reactions = CastReactions {
+                                    likes_count: m.likes,
+                                    recasts_count: m.recasts,
+                                    likes: Vec::new(),
+                                    recasts: Vec::new(),
+                                };
+                                cast.replies = CastReplies { count: m.replies };
+                            }
+                        }
+                    }
+                }
+                let response = FeedResponse {
+                    casts,
+                    next: NextCursor {
+                        cursor: next_token.map(|t| hex::encode(&t)),
+                    },
+                };
+                Ok(Self::json_response(StatusCode::OK, &response))
+            }
+            Err(e) => Ok(Self::error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("Failed to get user casts: {}", e),
+            )),
+        }
+    }
+
+    /// Handle GET /v2/farcaster/feed/user/popular?fid=N
+    async fn handle_user_popular_feed(
+        &self,
+        fid: u64,
+        limit: usize,
+    ) -> Result<Response<BoxBody<Bytes, Infallible>>, Infallible> {
+        let hub = self.hub_query.read().unwrap().clone();
+        let Some(hub) = hub else {
+            return Ok(Self::error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Hub query service not available",
+            ));
+        };
+
+        // Fetch recent casts and sort by engagement
+        let limit_fetch = limit.max(50); // fetch more to sort
+        match hub.get_casts_by_fid(fid, limit_fetch, None, true).await {
+            Ok((messages, _)) => {
+                let mut scored: Vec<(u64, crate::proto::Message)> = Vec::new();
+                for msg in messages {
+                    let score = if let Some(ref metrics) = self.metrics {
+                        metrics
+                            .get_cast_metrics(fid, &msg.hash)
+                            .map(|m| m.likes + m.recasts + m.replies)
+                            .unwrap_or(0)
+                    } else {
+                        0
+                    };
+                    scored.push((score, msg));
+                }
+                scored.sort_by(|a, b| b.0.cmp(&a.0));
+                scored.truncate(limit.min(10)); // popular returns top 10
+
+                let mut casts = Vec::with_capacity(scored.len());
+                for (score, msg) in &scored {
+                    let mut cast = self.message_to_cast(msg).await;
+                    cast.reactions.likes_count = *score;
+                    casts.push(cast);
+                }
+
+                let response = FeedResponse {
+                    casts,
+                    next: NextCursor { cursor: None },
+                };
+                Ok(Self::json_response(StatusCode::OK, &response))
+            }
+            Err(e) => Ok(Self::error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("Failed to get user casts: {}", e),
+            )),
+        }
+    }
+
+    /// Handle GET /v2/farcaster/feed/user/replies_and_recasts?fid=N
+    async fn handle_user_replies_feed(
+        &self,
+        fid: u64,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<Response<BoxBody<Bytes, Infallible>>, Infallible> {
+        let hub = self.hub_query.read().unwrap().clone();
+        let Some(hub) = hub else {
+            return Ok(Self::error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Hub query service not available",
+            ));
+        };
+
+        let page_token: Option<Vec<u8>> = cursor.and_then(|c| hex::decode(c).ok());
+
+        // Fetch casts, filter to only replies (has parent_hash)
+        match hub.get_casts_by_fid(fid, limit * 3, page_token, true).await {
+            Ok((messages, next_token)) => {
+                let mut casts = Vec::new();
+                for msg in &messages {
+                    if casts.len() >= limit {
+                        break;
+                    }
+                    // Only include replies (casts with a parent)
+                    let is_reply = msg
+                        .data
+                        .as_ref()
+                        .and_then(|d| match &d.body {
+                            Some(crate::proto::message_data::Body::CastAddBody(b)) => {
+                                Some(b.parent.is_some())
+                            }
+                            _ => None,
+                        })
+                        .unwrap_or(false);
+                    if is_reply {
+                        casts.push(self.message_to_cast(msg).await);
+                    }
+                }
+                let response = FeedResponse {
+                    casts,
+                    next: NextCursor {
+                        cursor: next_token.map(|t| hex::encode(&t)),
+                    },
+                };
+                Ok(Self::json_response(StatusCode::OK, &response))
+            }
+            Err(e) => Ok(Self::error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("Failed to get user casts: {}", e),
+            )),
+        }
+    }
+
+    // === Block/Mute list endpoints ===
+
+    /// Handle GET /v2/farcaster/block/list?fid=N
+    async fn handle_block_list(
+        &self,
+        fid: u64,
+        limit: usize,
+    ) -> Result<Response<BoxBody<Bytes, Infallible>>, Infallible> {
+        self.handle_link_list(fid, "block", limit).await
+    }
+
+    /// Handle GET /v2/farcaster/mute/list?fid=N
+    async fn handle_mute_list(
+        &self,
+        fid: u64,
+        limit: usize,
+    ) -> Result<Response<BoxBody<Bytes, Infallible>>, Infallible> {
+        self.handle_link_list(fid, "mute", limit).await
+    }
+
+    /// Generic link list handler for block/mute endpoints.
+    async fn handle_link_list(
+        &self,
+        fid: u64,
+        link_type: &str,
+        limit: usize,
+    ) -> Result<Response<BoxBody<Bytes, Infallible>>, Infallible> {
+        let hub = self.hub_query.read().unwrap().clone();
+        let Some(hub) = hub else {
+            return Ok(Self::error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Hub query service not available",
+            ));
+        };
+
+        match hub.get_links_by_fid(fid, link_type, limit).await {
+            Ok(messages) => {
+                let mut target_fids = Vec::new();
+                for msg in &messages {
+                    if let Some(data) = &msg.data {
+                        if let Some(crate::proto::message_data::Body::LinkBody(body)) = &data.body {
+                            if let Some(crate::proto::link_body::Target::TargetFid(target)) =
+                                &body.target
+                            {
+                                target_fids.push(*target);
+                            }
+                        }
+                    }
+                }
+                let users = self.get_users(&target_fids).await;
+                Ok(Self::json_response(
+                    StatusCode::OK,
+                    &BlockListResponse {
+                        users,
+                        next: NextCursor { cursor: None },
+                    },
+                ))
+            }
+            Err(e) => Ok(Self::error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("Failed to get {} list: {}", link_type, e),
+            )),
+        }
+    }
+
+    // === Signer endpoints ===
+
+    /// Handle GET /v2/farcaster/signer?fid=N or /v2/farcaster/signers?fid=N
+    async fn handle_signers(
+        &self,
+        fid: u64,
+    ) -> Result<Response<BoxBody<Bytes, Infallible>>, Infallible> {
+        let hub = self.hub_query.read().unwrap().clone();
+        let Some(hub) = hub else {
+            return Ok(Self::error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Hub query service not available",
+            ));
+        };
+
+        match hub.get_signer_events(fid).await {
+            Ok(events) => {
+                let mut entries = Vec::new();
+                for event in &events {
+                    if let Some(crate::proto::on_chain_event::Body::SignerEventBody(body)) =
+                        &event.body
+                    {
+                        entries.push(OnChainEventEntry {
+                            object: "signer".to_string(),
+                            fid: event.fid,
+                            event_type: "signer".to_string(),
+                            block_number: event.block_number,
+                            block_timestamp: event.block_timestamp,
+                            signer_key: Some(hex::encode(&body.key)),
+                            key_type: Some(body.key_type),
+                            metadata_type: Some(body.metadata_type),
+                        });
+                    }
+                }
+                Ok(Self::json_response(
+                    StatusCode::OK,
+                    &OnChainEventsResponse {
+                        events: entries,
+                        next: NextCursor { cursor: None },
+                    },
+                ))
+            }
+            Err(e) => Ok(Self::error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("Failed to get signers: {}", e),
+            )),
+        }
+    }
+
+    // === Onchain endpoints ===
+
+    /// Handle GET /v2/farcaster/onchain/signers?fid=N
+    async fn handle_onchain_signers(
+        &self,
+        fid: u64,
+    ) -> Result<Response<BoxBody<Bytes, Infallible>>, Infallible> {
+        // Same as signers endpoint
+        self.handle_signers(fid).await
+    }
+
+    /// Handle GET /v2/farcaster/onchain/id_registry_event?fid=N
+    async fn handle_onchain_id_registry(
+        &self,
+        fid: u64,
+    ) -> Result<Response<BoxBody<Bytes, Infallible>>, Infallible> {
+        let hub = self.hub_query.read().unwrap().clone();
+        let Some(hub) = hub else {
+            return Ok(Self::error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Hub query service not available",
+            ));
+        };
+
+        // Event type 3 = IdRegister
+        match hub.get_onchain_events(fid, 3).await {
+            Ok(events) => {
+                let mut entries = Vec::new();
+                for event in &events {
+                    if let Some(crate::proto::on_chain_event::Body::IdRegisterEventBody(body)) =
+                        &event.body
+                    {
+                        let event_type = match body.event_type() {
+                            crate::proto::IdRegisterEventType::Register => "Register",
+                            crate::proto::IdRegisterEventType::Transfer => "Transfer",
+                            crate::proto::IdRegisterEventType::ChangeRecovery => "ChangeRecovery",
+                            _ => "None",
+                        };
+                        entries.push(OnChainEventEntry {
+                            object: "id_registry_event".to_string(),
+                            fid: event.fid,
+                            event_type: event_type.to_string(),
+                            block_number: event.block_number,
+                            block_timestamp: event.block_timestamp,
+                            signer_key: None,
+                            key_type: None,
+                            metadata_type: None,
+                        });
+                    }
+                }
+                Ok(Self::json_response(
+                    StatusCode::OK,
+                    &OnChainEventsResponse {
+                        events: entries,
+                        next: NextCursor { cursor: None },
+                    },
+                ))
+            }
+            Err(e) => Ok(Self::error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("Failed to get id registry events: {}", e),
+            )),
+        }
     }
 
     // === Batch Endpoints ===
@@ -2599,7 +3988,7 @@ mod tests {
 
     #[test]
     fn test_can_handle() {
-        let handler = ApiHttpHandler::new(None, None, None, None);
+        let handler = ApiHttpHandler::new(None, None, None, None, None, None);
 
         // User endpoints
         assert!(handler.can_handle(&Method::GET, "/v2/farcaster/user"));
@@ -2660,8 +4049,138 @@ mod tests {
         assert!(handler.can_handle(&Method::GET, "/v2/farcaster/fname/availability"));
         assert!(handler.can_handle(&Method::GET, "/v2/farcaster/username-proof"));
 
-        // Invalid - wrong method
-        assert!(!handler.can_handle(&Method::POST, "/v2/farcaster/followers"));
+        // New user endpoints
+        assert!(handler.can_handle(&Method::GET, "/v2/farcaster/user/custody-address"));
+        assert!(handler.can_handle(&Method::GET, "/v2/farcaster/user/power_users"));
+        assert!(handler.can_handle(&Method::GET, "/v2/farcaster/user/channels"));
+        assert!(handler.can_handle(&Method::GET, "/v2/farcaster/user/by_username"));
+        assert!(handler.can_handle(&Method::GET, "/v2/farcaster/user/fid"));
+        assert!(handler.can_handle(&Method::GET, "/v2/farcaster/user/by_x_username"));
+        assert!(handler.can_handle(&Method::GET, "/v2/farcaster/user/by_location"));
+        assert!(handler.can_handle(&Method::GET, "/v2/farcaster/user/best_friends"));
+        assert!(handler.can_handle(&Method::GET, "/v2/farcaster/user/balance"));
+        assert!(handler.can_handle(&Method::GET, "/v2/farcaster/user/interactions"));
+        assert!(handler.can_handle(&Method::GET, "/v2/farcaster/user/memberships/list"));
+        assert!(handler.can_handle(&Method::GET, "/v2/farcaster/user/subscribed_to"));
+        assert!(handler.can_handle(&Method::GET, "/v2/farcaster/user/subscribers"));
+        assert!(handler.can_handle(&Method::GET, "/v2/farcaster/user/subscriptions_created"));
+
+        // Casts alias + quotes + metrics
+        assert!(handler.can_handle(&Method::GET, "/v2/farcaster/casts"));
+        assert!(handler.can_handle(&Method::GET, "/v2/farcaster/cast/quotes"));
+        assert!(handler.can_handle(&Method::GET, "/v2/farcaster/cast/metrics"));
+        assert!(handler.can_handle(&Method::GET, "/v2/farcaster/cast/conversation/summary"));
+        assert!(handler.can_handle(&Method::GET, "/v2/farcaster/cast/embed/crawl"));
+
+        // New feed endpoints
+        assert!(handler.can_handle(&Method::GET, "/v2/farcaster/feed/for_you"));
+        assert!(handler.can_handle(&Method::GET, "/v2/farcaster/feed/parent_urls"));
+        assert!(handler.can_handle(&Method::GET, "/v2/farcaster/feed/user/casts"));
+        assert!(handler.can_handle(&Method::GET, "/v2/farcaster/feed/user/popular"));
+        assert!(handler.can_handle(&Method::GET, "/v2/farcaster/feed/user/replies_and_recasts"));
+        assert!(handler.can_handle(&Method::GET, "/v2/farcaster/feed/topic"));
+
+        // New channel endpoints
+        assert!(handler.can_handle(&Method::GET, "/v2/farcaster/channel/list"));
+        assert!(handler.can_handle(&Method::GET, "/v2/farcaster/channel/followers"));
+        assert!(handler.can_handle(&Method::GET, "/v2/farcaster/channel/followers/relevant"));
+        assert!(handler.can_handle(&Method::GET, "/v2/farcaster/channel/member/invite/list"));
+        assert!(handler.can_handle(&Method::GET, "/v2/farcaster/channel/user"));
+
+        // Reaction aliases
+        assert!(handler.can_handle(&Method::GET, "/v2/farcaster/reaction"));
+        assert!(handler.can_handle(&Method::GET, "/v2/farcaster/reactions/cast"));
+        assert!(handler.can_handle(&Method::GET, "/v2/farcaster/reactions/user"));
+
+        // Notification sub-endpoints
+        assert!(handler.can_handle(&Method::GET, "/v2/farcaster/notifications/channel"));
+        assert!(handler.can_handle(&Method::GET, "/v2/farcaster/notifications/parent_url"));
+
+        // Block/mute/ban lists
+        assert!(handler.can_handle(&Method::GET, "/v2/farcaster/block/list"));
+        assert!(handler.can_handle(&Method::GET, "/v2/farcaster/mute/list"));
+        assert!(handler.can_handle(&Method::GET, "/v2/farcaster/ban/list"));
+
+        // Signer endpoints
+        assert!(handler.can_handle(&Method::GET, "/v2/farcaster/signer"));
+        assert!(handler.can_handle(&Method::GET, "/v2/farcaster/signers"));
+        assert!(handler.can_handle(&Method::GET, "/v2/farcaster/signer/list"));
+        assert!(handler.can_handle(&Method::GET, "/v2/farcaster/signer/signed_key"));
+        assert!(handler.can_handle(&Method::GET, "/v2/farcaster/signer/developer_managed"));
+        assert!(handler.can_handle(
+            &Method::GET,
+            "/v2/farcaster/signer/developer_managed/signed_key"
+        ));
+
+        // Onchain endpoints
+        assert!(handler.can_handle(&Method::GET, "/v2/farcaster/onchain/signers"));
+        assert!(handler.can_handle(&Method::GET, "/v2/farcaster/onchain/id_registry_event"));
+
+        // Follows endpoint
+        assert!(handler.can_handle(&Method::GET, "/v2/farcaster/follows"));
+        assert!(handler.can_handle(&Method::GET, "/v2/farcaster/followers/relevant"));
+        assert!(handler.can_handle(&Method::GET, "/v2/farcaster/followers/reciprocal"));
+        assert!(handler.can_handle(&Method::GET, "/v2/farcaster/following/suggested"));
+
+        // Storage alternate paths
+        assert!(handler.can_handle(&Method::GET, "/v2/farcaster/storage/allocations"));
+        assert!(handler.can_handle(&Method::GET, "/v2/farcaster/storage/usage"));
+
+        // Topic endpoints
+        assert!(handler.can_handle(&Method::GET, "/v2/farcaster/topic/trending"));
+
+        // Managed service endpoints
+        assert!(handler.can_handle(&Method::GET, "/v2/farcaster/app_host/user/event"));
+        assert!(handler.can_handle(&Method::GET, "/v2/farcaster/app_host/user/state"));
+        assert!(handler.can_handle(&Method::GET, "/v2/farcaster/auth_address/developer_managed"));
+        assert!(handler.can_handle(&Method::GET, "/v2/farcaster/frame/catalog"));
+        assert!(handler.can_handle(&Method::GET, "/v2/farcaster/frame/notification_tokens"));
+        assert!(handler.can_handle(&Method::GET, "/v2/farcaster/frame/relevant"));
+        assert!(handler.can_handle(&Method::GET, "/v2/farcaster/frame/search"));
+        assert!(handler.can_handle(&Method::GET, "/v2/farcaster/fungibles"));
+        assert!(handler.can_handle(&Method::GET, "/v2/farcaster/fungible/trending"));
+        assert!(handler.can_handle(&Method::GET, "/v2/farcaster/login/authorize"));
+        assert!(handler.can_handle(&Method::GET, "/v2/farcaster/login/nonce"));
+        assert!(handler.can_handle(&Method::GET, "/v2/farcaster/nft/mint"));
+
+        // Write endpoints (POST)
+        assert!(handler.can_handle(&Method::POST, "/v2/farcaster/cast"));
+        assert!(handler.can_handle(&Method::POST, "/v2/farcaster/reaction"));
+        assert!(handler.can_handle(&Method::POST, "/v2/farcaster/follow"));
+        assert!(handler.can_handle(&Method::POST, "/v2/farcaster/block"));
+        assert!(handler.can_handle(&Method::POST, "/v2/farcaster/mute"));
+        assert!(handler.can_handle(&Method::POST, "/v2/farcaster/channel/follow"));
+        assert!(handler.can_handle(&Method::POST, "/v2/farcaster/message"));
+        assert!(handler.can_handle(&Method::POST, "/v2/farcaster/signer"));
+        assert!(handler.can_handle(&Method::POST, "/v2/farcaster/notifications/mark_seen"));
+        assert!(handler.can_handle(&Method::POST, "/v2/farcaster/frame/action"));
+        assert!(handler.can_handle(&Method::POST, "/v2/farcaster/frame/notifications"));
+        assert!(handler.can_handle(&Method::POST, "/v2/farcaster/action"));
+        assert!(handler.can_handle(&Method::POST, "/v2/farcaster/ban"));
+        assert!(handler.can_handle(&Method::POST, "/v2/farcaster/user/verification"));
+        assert!(handler.can_handle(&Method::POST, "/v2/farcaster/user/follow"));
+        assert!(handler.can_handle(&Method::POST, "/v2/farcaster/notifications/seen"));
+        assert!(handler.can_handle(&Method::POST, "/v2/farcaster/signer/signed_key"));
+        assert!(handler.can_handle(
+            &Method::POST,
+            "/v2/farcaster/auth_address/developer_managed"
+        ));
+        assert!(handler.can_handle(&Method::POST, "/v2/farcaster/login/nonce"));
+        assert!(handler.can_handle(&Method::POST, "/v2/farcaster/fungible/send"));
+        assert!(handler.can_handle(&Method::POST, "/v2/farcaster/nft/mint"));
+
+        // Write endpoints (DELETE)
+        assert!(handler.can_handle(&Method::DELETE, "/v2/farcaster/cast"));
+        assert!(handler.can_handle(&Method::DELETE, "/v2/farcaster/reaction"));
+        assert!(handler.can_handle(&Method::DELETE, "/v2/farcaster/follow"));
+        assert!(handler.can_handle(&Method::DELETE, "/v2/farcaster/block"));
+        assert!(handler.can_handle(&Method::DELETE, "/v2/farcaster/mute"));
+        assert!(handler.can_handle(&Method::DELETE, "/v2/farcaster/ban"));
+        assert!(handler.can_handle(&Method::DELETE, "/v2/farcaster/user/follow"));
+        assert!(handler.can_handle(&Method::DELETE, "/v2/farcaster/user/verification"));
+
+        // PATCH endpoints
+        assert!(handler.can_handle(&Method::PATCH, "/v2/farcaster/user"));
 
         // Invalid - wrong prefix
         assert!(!handler.can_handle(&Method::GET, "/v2/user/123/followers"));

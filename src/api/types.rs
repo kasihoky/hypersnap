@@ -523,6 +523,46 @@ pub struct StorageUsage {
     pub capacity: u64,
 }
 
+/// Response for block/mute list endpoints.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BlockListResponse {
+    pub users: Vec<User>,
+    pub next: NextCursor,
+}
+
+/// Response for onchain signer query.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SignerResponse {
+    pub object: String,
+    pub signer_uuid: String,
+    pub public_key: String,
+    pub fid: u64,
+    pub status: String,
+}
+
+/// Response for onchain events query.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OnChainEventsResponse {
+    pub events: Vec<OnChainEventEntry>,
+    pub next: NextCursor,
+}
+
+/// An onchain event entry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OnChainEventEntry {
+    pub object: String,
+    pub fid: u64,
+    pub event_type: String,
+    pub block_number: u32,
+    pub block_timestamp: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signer_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key_type: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata_type: Option<u32>,
+}
+
 /// Error response matching Farcaster format.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ErrorResponse {

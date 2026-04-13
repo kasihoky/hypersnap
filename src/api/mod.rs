@@ -25,6 +25,7 @@
 pub mod backfill;
 pub mod bridge;
 pub mod cast_hash_index;
+pub mod cast_quotes_index;
 pub mod channels;
 pub mod config;
 pub mod conversations;
@@ -38,6 +39,7 @@ pub mod search;
 pub mod social_graph;
 pub mod ssrf;
 pub mod types;
+pub mod user_data_index;
 pub mod user_hydrator;
 pub mod webhooks;
 pub mod worker;
@@ -45,6 +47,7 @@ pub mod worker;
 pub use backfill::BackfillManager;
 pub use bridge::HubEventBridge;
 pub use cast_hash_index::CastHashIndexer;
+pub use cast_quotes_index::CastQuotesIndexer;
 pub use channels::ChannelsIndexer;
 pub use config::ApiConfig;
 pub use config::FeatureConfig;
@@ -56,6 +59,7 @@ pub use indexer::{Indexer, IndexerError};
 pub use metrics::MetricsIndexer;
 pub use search::SearchIndexer;
 pub use social_graph::SocialGraphIndexer;
+pub use user_data_index::UserDataIndexer;
 pub use user_hydrator::HubUserHydrator;
 pub use worker::IndexWorkerPool;
 
@@ -244,9 +248,29 @@ pub fn initialize(
     };
     let cast_hash_indexer = Arc::new(CastHashIndexer::new(cast_hash_config, db.clone()));
 
+    // Cast quotes index is always enabled when API is enabled — it's
+    // needed for the /v2/farcaster/cast/quotes/ endpoint.
+    let quotes_config = FeatureConfig {
+        enabled: true,
+        backfill_on_startup: true,
+        ..Default::default()
+    };
+    let cast_quotes_indexer = Arc::new(CastQuotesIndexer::new(quotes_config, db.clone()));
+
+    // User data index is always enabled when API is enabled — it's
+    // needed for /v2/farcaster/user/by_x_username and by_location.
+    let user_data_config = FeatureConfig {
+        enabled: true,
+        backfill_on_startup: true,
+        ..Default::default()
+    };
+    let user_data_indexer = Arc::new(UserDataIndexer::new(user_data_config, db.clone()));
+
     // Collect indexers that need backfill
     let mut backfill_indexers: Vec<Arc<dyn Indexer>> = Vec::new();
     backfill_indexers.push(cast_hash_indexer.clone());
+    backfill_indexers.push(cast_quotes_indexer.clone());
+    backfill_indexers.push(user_data_indexer.clone());
     if config.social_graph.backfill_on_startup {
         if let Some(ref idx) = social_graph_indexer {
             backfill_indexers.push(idx.clone());
@@ -271,6 +295,8 @@ pub fn initialize(
     let mut worker_pool = IndexWorkerPool::new(config.clone(), index_rx, db.clone());
 
     worker_pool.register_arc(cast_hash_indexer.clone());
+    worker_pool.register_arc(cast_quotes_indexer.clone());
+    worker_pool.register_arc(user_data_indexer.clone());
 
     if let Some(ref indexer) = social_graph_indexer {
         worker_pool.register_arc(indexer.clone());
@@ -452,6 +478,8 @@ pub fn initialize(
         channels_indexer,
         metrics_indexer,
         Some(cast_hash_indexer),
+        Some(cast_quotes_indexer),
+        Some(user_data_indexer),
     );
 
     // Mini app notifications — two stateful HTTP handlers wired here,

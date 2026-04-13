@@ -2805,4 +2805,87 @@ impl crate::api::HubQueryHandler for MyHubService {
         self.get_onchain_events(fid, crate::proto::OnChainEventType::EventTypeSigner as i32)
             .await
     }
+
+    async fn get_links_by_fid(
+        &self,
+        fid: u64,
+        link_type: &str,
+        limit: usize,
+    ) -> Result<Vec<Message>, String> {
+        let stores = self
+            .get_stores_for(fid)
+            .map_err(|e| e.message().to_string())?;
+        let options = PageOptions {
+            page_size: Some(limit),
+            page_token: None,
+            reverse: false,
+        };
+        let page = LinkStore::get_link_adds_by_fid(
+            &stores.link_store,
+            fid,
+            link_type.to_string(),
+            &options,
+        )
+        .map_err(|e| format!("{:?}", e))?;
+        Ok(page.messages)
+    }
+
+    async fn get_user_data_by_fid(&self, fid: u64) -> Result<Vec<Message>, String> {
+        let stores = self
+            .get_stores_for(fid)
+            .map_err(|e| e.message().to_string())?;
+        let options = PageOptions {
+            page_size: Some(100),
+            page_token: None,
+            reverse: false,
+        };
+        let page = UserDataStore::get_user_data_adds_by_fid(
+            &stores.user_data_store,
+            fid,
+            &options,
+            None,
+            None,
+        )
+        .map_err(|e| format!("{:?}", e))?;
+        Ok(page.messages)
+    }
+
+    async fn get_user_data_value(&self, fid: u64, data_type: i32) -> Option<String> {
+        let stores = self.get_stores_for(fid).ok()?;
+        let ud_type = crate::proto::UserDataType::try_from(data_type).ok()?;
+        let msg =
+            UserDataStore::get_user_data_by_fid_and_type(&stores.user_data_store, fid, ud_type)
+                .ok()?;
+        if let Some(data) = &msg.data {
+            if let Some(message_data::Body::UserDataBody(body)) = &data.body {
+                return Some(body.value.clone());
+            }
+        }
+        None
+    }
+
+    async fn get_fids(
+        &self,
+        limit: usize,
+        cursor: Option<Vec<u8>>,
+    ) -> Result<(Vec<u64>, Option<Vec<u8>>), String> {
+        let mut all_fids = Vec::new();
+        for stores in self.shard_stores.values() {
+            let options = PageOptions {
+                page_size: Some(limit),
+                page_token: cursor.clone(),
+                reverse: false,
+            };
+            match stores.onchain_event_store.get_fids(&options) {
+                Ok((fids, _next)) => {
+                    all_fids.extend(fids);
+                }
+                Err(_) => continue,
+            }
+        }
+        all_fids.sort();
+        all_fids.dedup();
+        all_fids.truncate(limit);
+        Ok((all_fids, None))
+    }
 }
